@@ -1,0 +1,8 @@
+pandas
+numpy
+openpyxl
+sentence-transformers
+soundfile
+neo4j
+streamlit>=1.32
+google-genai>=2.3.0

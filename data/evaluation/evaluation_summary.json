@@ -1,0 +1,84 @@
+{
+  "generated_at_utc": "2026-10-23T08:23:47.270642+00:00",
+  "evaluation_set": "data\\evaluation\\evaluation_queries.csv",
+  "evaluation_design": "exploratory in-sample direct-recording smoke set; not held out",
+  "ground_truth_status": "dataset-associated IDs; not independently or manually confirmed",
+  "all_cases_marked_tuning": true,
+  "held_out_case_count": 0,
+  "distinct_compositions": 13,
+  "common_case_set": true,
+  "top_k": 5,
+  "metrics": {
+    "metadata_baseline": {
+      "eligible_cases": 13,
+      "successfully_evaluated": 13,
+      "failed_cases": 0,
+      "metric_denominator": 13,
+      "denominator_policy": "all eligible cases; failed or empty rankings contribute zero",
+      "top1": 0.0,
+      "recall_at_3": 0.0,
+      "recall_at_5": 0.0,
+      "mrr": 0.0
+    },
+    "text_only": {
+      "eligible_cases": 13,
+      "successfully_evaluated": 0,
+      "failed_cases": 13,
+      "metric_denominator": 13,
+      "denominator_policy": "all eligible cases; failed or empty rankings contribute zero",
+      "top1": 0.0,
+      "recall_at_3": 0.0,
+      "recall_at_5": 0.0,
+      "mrr": 0.0
+    },
+    "audio_only": {
+      "eligible_cases": 13,
+      "successfully_evaluated": 13,
+      "failed_cases": 0,
+      "metric_denominator": 13,
+      "denominator_policy": "all eligible cases; failed or empty rankings contribute zero",
+      "top1": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0,
+      "mrr": 1.0
+    },
+    "multimodal": {
+      "eligible_cases": 13,
+      "successfully_evaluated": 0,
+      "failed_cases": 13,
+      "metric_denominator": 13,
+      "denominator_policy": "all eligible cases; failed or empty rankings contribute zero",
+      "top1": 0.0,
+      "recall_at_3": 0.0,
+      "recall_at_5": 0.0,
+      "mrr": 0.0
+    }
+  },
+  "audio_index": {
+    "encountered": 14,
+    "indexed": 13,
+    "skipped": 1,
+    "failed": 0,
+    "skipped_audio_ids": [
+      "R014"
+    ],
+    "failures": {}
+  },
+  "text_engine_initialization_error": "Text engine initialization explicitly skipped by operator.",
+  "configuration": {
+    "text_model": "sentence-transformers/LaBSE",
+    "audio_features": "22.05 kHz mono; 20 MFCC-like + 12 chroma means/std; cosine similarity",
+    "fusion": "weighted reciprocal rank fusion; text 0.6, audio 0.4, rrf_constant 60",
+    "metadata_baseline": "case-insensitive alphanumeric substring match against title, singer, raga, tala; deterministic hit-count/length/ID tie-break",
+    "ranking_depth": 5,
+    "dataset_source": "annamayya_dataset_package/Annamayya_25_Song_Dataset.xlsx",
+    "dataset_fingerprint": "bb1fbff4ea5bddb6a3ec23dd7642a3396ca3e39486bf99afa8dec1a229e14bdb",
+    "random_seed": null
+  },
+  "limitations": [
+    "Each query recording is already part of the indexed set; identity retrieval is expected and is not cross-performance evidence.",
+    "The dataset does not provide an independent held-out query set or independently verified relevance judgments.",
+    "Failures and empty rankings contribute zero to all aggregate metrics; denominator is all eligible cases.",
+    "No weights or thresholds were tuned against a held-out set; all generated cases are explicitly marked as tuning/in-sample."
+  ]
+}

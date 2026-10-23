@@ -1,0 +1,44 @@
+﻿query_id,query_mode,query_text,query_audio_path,expected_composition_ids,match_type,source_reference,verification_status,is_tuning_case,is_held_out,notes
+direct-R001,text_audio,"అదివో అల్లదివో హరివాసము
+పదివేలుశేషుల పడగల మయము
+
+అదె వేంకటాచల మఖిలవున్నతము
+అదివో బ్రహ్మాదుల కపురూపము
+అదివో నిత్యనివాస మఖిలమునులకు-
+నదె చూడుఁడదె మొక్కుఁడానంద మయము
+
+చెంగట నల్లదివో శేషాచలము
+నింగినున్న దేవతల నిజవాసము
+ముంగిట నల్లదివో మూలనున్న ధనమ",Recordings/audio001.mp3,ANN-001,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx | https://templesinindiainfo.com/annamayya-keerthana-adivo-alladivo-in-english-with-meaning/,dataset_association_only,true,false,"Query uses indexed recording R001 and its dataset-associated text for Adivo Alladivo Sri Hari Vasamu; in-sample smoke case, not independent ground truth."
+direct-R002,text_audio,"కొండలలో నెలకొన్న కోనేటిరాయఁడు వాఁడు
+కొండలంత వరములు గుప్పెడు వాఁడు
+
+కుమ్మరదాసుఁడైన కురువరతినంబి
+ఇమ్మన్నవరములెల్ల నిచ్చినవాఁడు
+దొమ్ములు సేసినయట్టి తొండమాంజక్కురవర్తి
+రమ్మనచోటికి వచ్చి నమ్మినవాఁడు
+
+అచ్చపు వేడుకతోడ ననంతాళువారికి
+ముచ్చిలి వెట్టి",Recordings/audio003.mp3,ANN-003,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx | https://annamayya-sankirthana.blogspot.com/2013/06/kondalalo-nelakonna.html,dataset_association_only,true,false,"Query uses indexed recording R002 and its dataset-associated text for Kondalalo Nelakonna Konetirayadu; in-sample smoke case, not independent ground truth."
+direct-R003,text_audio,"మానుషము గాదు మఱి దైవికము గాని
+రానున్నా అది రాకుమన్నఁ బోదు",Recordings/audio008.mp3,ANN-008,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R003 and its dataset-associated text for Manushamu Gaadu Mari Daivikamu Gaani; in-sample smoke case, not independent ground truth."
+direct-R004,text_audio,"సదా సకలము సంపదలే
+తుద దెలియఁగ వలెఁ దొలఁగఁగవలయు",Recordings/audio009.mp3,ANN-009,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R004 and its dataset-associated text for Sadaa Sakalamu Sampadale; in-sample smoke case, not independent ground truth."
+direct-R005,text_audio,"ఇందిరానామ మిందరికి
+కుందనపుముద్ద వో గోవింద",Recordings/audio010.mp3,ANN-010,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R005 and its dataset-associated text for Indira Nama Mindariki; in-sample smoke case, not independent ground truth."
+direct-R006,text_audio,"సహజ వైష్ణవాచార వర్తనుల-
+సహవాసమె మాసంధ్య",Recordings/audio012.mp3,ANN-012,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R006 and its dataset-associated text for Sahaja Vaishnavaachara Vartanula; in-sample smoke case, not independent ground truth."
+direct-R007,text_audio,"ఇందుకొరకె యిందరును నిట్లయిరి
+కిందుపడి మఱికాని గెలుపెఱఁగరాదు",Recordings/audio013.mp3,ANN-013,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R007 and its dataset-associated text for Indukorake Indarunu Itlayiri; in-sample smoke case, not independent ground truth."
+direct-R008,text_audio,"మలసీఁ జూడరో మగ సింహము
+అలని మీఱిన మాయల సింహము",Recordings/audio015.mp3,ANN-015,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R008 and its dataset-associated text for MalasI Chudaro Maga Simhamu; in-sample smoke case, not independent ground truth."
+direct-R009,text_audio,"దిబ్బలు వెట్టుచుఁ దేలిన దిదివో
+ఉబ్బు నీటిపై నొక హంసా",Recordings/audio018.mp3,ANN-018,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R009 and its dataset-associated text for Dibbalu Vettuchu Delina Didivo; in-sample smoke case, not independent ground truth."
+direct-R010,text_audio,"తెలియఁ జీకటికి దీపమెత్తక పెద్ద-
+వెలుఁగులోపలికి వెలుఁగేలా",Recordings/audio020.mp3,ANN-020,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R010 and its dataset-associated text for Teliya Cheekatiki Deepam Ettaka Pedda; in-sample smoke case, not independent ground truth."
+direct-R011,text_audio,"చిత్తములో నిన్నుఁ జింతించనేరక
+మత్తుఁడఁనై పులుమానిసినైతి",Recordings/audio021.mp3,ANN-021,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R011 and its dataset-associated text for Chittamulo Ninnu Chintinchaneraka; in-sample smoke case, not independent ground truth."
+direct-R012,text_audio,"అన్నియును నతని కృత్యములే
+యెన్నియైనానవు నతఁడేమి సేసినను",Recordings/audio022.mp3,ANN-022,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R012 and its dataset-associated text for Anniyunu Atani Krutyamule; in-sample smoke case, not independent ground truth."
+direct-R013,text_audio,"ఇందిర వడ్డించ నింపుగను
+చిందక యిట్లే భుజించవో స్వామి-",Recordings/audio024.mp3,ANN-024,same_recording_in_index,https://www.tirumala.org/Annamacharya_Keertanas_Sravanam.aspx,dataset_association_only,true,false,"Query uses indexed recording R013 and its dataset-associated text for Indira Vaddincha Nimpuganu; in-sample smoke case, not independent ground truth."
