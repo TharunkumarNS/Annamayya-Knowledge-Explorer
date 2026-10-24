@@ -15,6 +15,8 @@ from pathlib import Path
 import tempfile
 from typing import Any, Iterator
 from urllib.parse import urlparse
+import streamlit.components.v1 as components
+from pyvis.network import Network
 
 import pandas as pd
 
@@ -361,14 +363,82 @@ def _render_details(data: dict[str, Any], composition_id: str) -> None:
         st.text(str(notes))
     _render_source_links(composition)
 
+def render_interactive_graph(graph_data: dict[str, Any], height_px: int = 420) -> None:
+    """Render a PyVis interactive physics network directly from retrieved graph data."""
+    if not graph_data or not graph_data.get("composition"):
+        return
+
+    net = Network(height=f"{height_px}px", width="100%", bgcolor="#fffefa", font_color="#292720")
+    
+    color_map = {
+        "Composition": "#702b2b",     # Deep Maroon
+        "Singer": "#2b5b70",          # Teal
+        "Raga": "#5b2b70",            # Purple
+        "Tala": "#705b2b",            # Gold
+        "TextRecord": "#a58a4e",      # Muted Gold
+        "AudioRecording": "#2b7045",  # Green
+    }
+
+    comp = graph_data["composition"]
+    comp_id = str(comp.get("composition_id", "Composition"))
+    comp_label = str(comp.get("canonical_title") or comp_id)
+    
+    # Central Composition node
+    net.add_node(comp_id, label=comp_label, title=f"Composition: {comp_label}", color=color_map["Composition"])
+
+    # Metadata nodes
+    for singer in (graph_data.get("singers") or []):
+        if singer:
+            node_id = f"Singer_{singer}"
+            net.add_node(node_id, label=str(singer), title=f"Singer: {singer}", color=color_map["Singer"])
+            net.add_edge(comp_id, node_id, title="PERFORMED_BY")
+
+    for raga in (graph_data.get("ragas") or []):
+        if raga:
+            node_id = f"Raga_{raga}"
+            net.add_node(node_id, label=str(raga), title=f"Raga: {raga}", color=color_map["Raga"])
+            net.add_edge(comp_id, node_id, title="USES_RAGA")
+
+    for tala in (graph_data.get("talas") or []):
+        if tala:
+            node_id = f"Tala_{tala}"
+            net.add_node(node_id, label=str(tala), title=f"Tala: {tala}", color=color_map["Tala"])
+            net.add_edge(comp_id, node_id, title="USES_TALA")
+
+    for text in (graph_data.get("text_records") or []):
+        if text and text.get("text_id"):
+            tid = str(text["text_id"])
+            label = f"{text.get('text_type', 'Text').replace('_', ' ').title()}\n({tid})"
+            net.add_node(tid, label=label, title=f"TextRecord: {tid}", color=color_map["TextRecord"])
+            net.add_edge(tid, comp_id, title="BELONGS_TO")
+
+    for audio in (graph_data.get("audio_records") or []):
+        if audio and audio.get("audio_id"):
+            aid = str(audio["audio_id"])
+            label = f"Audio: {aid}"
+            net.add_node(aid, label=label, title=f"AudioRecording: {aid}", color=color_map["AudioRecording"])
+            net.add_edge(aid, comp_id, title="RECORDING_OF")
+
+    net.toggle_physics(True)
+    
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as temp_file:
+        temp_path = temp_file.name
+    net.write_html(temp_path)
+    
+    with open(temp_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
+
+    components.html(html_content, height=height_px + 20)
 
 def _render_graph_data(graph_data: Any) -> None:
     if not isinstance(graph_data, dict):
         return
     st.markdown("**Verified graph relationships**")
-    composition = graph_data.get("composition") or {}
-    if composition:
-        st.json(composition)
+    render_interactive_graph(graph_data)
     for label, key in (("Singers", "singers"), ("Ragas", "ragas"), ("Talas", "talas")):
         values = [value for value in (graph_data.get(key) or []) if value]
         if values:
@@ -377,7 +447,6 @@ def _render_graph_data(graph_data: Any) -> None:
         values = [value for value in (graph_data.get(key) or []) if value]
         if values:
             st.write(f"**{label}:** {len(values)} linked")
-            st.json(values)
 
 
 def _metadata_line(metadata: dict[str, Any]) -> str:

@@ -288,8 +288,8 @@ def main() -> None:
     parser.add_argument("--graph", action="store_true", help="Enrich results from configured Neo4j")
     parser.add_argument("--import-graph", action="store_true", help="Import the normalized dataset before searching")
     args = parser.parse_args()
-    if not args.text and not args.audio:
-        parser.error("provide --text, --audio, or both")
+    if not args.text and not args.audio and not args.import_graph:
+        parser.error("provide --text, --audio, or --import-graph")
 
     engine, graph = _make_demo(args)
     try:

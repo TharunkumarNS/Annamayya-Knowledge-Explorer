@@ -239,6 +239,33 @@ class AnnamayyaKnowledgeGraph:
         with self._require_driver().session() as session:
             return self._records(session.run(query, value=cleaned))
 
+    def get_graph_network(self, composition_id: str | None = None) -> list[dict[str, Any]]:
+        """Fetch node connections for PyVis graph visualization."""
+        driver = self._require_driver()
+        if composition_id:
+            query = (
+                "MATCH (c:Composition {composition_id: $composition_id})-[r]-(n) "
+                "RETURN labels(c)[0] as source_type, c.composition_id as source_id, "
+                "coalesce(c.canonical_title, c.composition_id) as source_label, "
+                "type(r) as relation, labels(n)[0] as target_type, "
+                "coalesce(n.composition_id, n.text_id, n.audio_id, n.name) as target_id, "
+                "coalesce(n.canonical_title, n.recording_title, n.name, n.text_id) as target_label"
+            )
+            params = {"composition_id": composition_id}
+        else:
+            query = (
+                "MATCH (a)-[r]->(b) "
+                "RETURN labels(a)[0] as source_type, "
+                "coalesce(a.composition_id, a.text_id, a.audio_id, a.name) as source_id, "
+                "coalesce(a.canonical_title, a.recording_title, a.name, a.text_id) as source_label, "
+                "type(r) as relation, labels(b)[0] as target_type, "
+                "coalesce(b.composition_id, b.text_id, b.audio_id, b.name) as target_id, "
+                "coalesce(b.canonical_title, b.recording_title, b.name, b.text_id) as target_label"
+            )
+            params = {}
+        with driver.session() as session:
+            return [record.data() for record in session.run(query, **params)]
+
     def close(self) -> None:
         """Close and release the underlying Neo4j driver, if any."""
         if self.driver is not None:
