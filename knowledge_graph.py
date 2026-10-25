@@ -239,6 +239,122 @@ class AnnamayyaKnowledgeGraph:
         with self._require_driver().session() as session:
             return self._records(session.run(query, value=cleaned))
 
+    def get_graph_snapshot(self, limit: int = 500) -> dict[str, list[dict[str, Any]]]:
+        """Return a bounded set of nodes and relationships for graph visualization."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        query = (
+            "MATCH (source)-[relationship]->(target) "
+            "RETURN elementId(source) AS source_id, labels(source) AS source_labels, "
+            "properties(source) AS source_properties, type(relationship) AS relationship, "
+            "elementId(target) AS target_id, labels(target) AS target_labels, "
+            "properties(target) AS target_properties "
+            "ORDER BY source_id, target_id, relationship LIMIT $limit"
+        )
+        with self._require_driver().session() as session:
+            records = self._records(session.run(query, limit=limit))
+
+        nodes: dict[str, dict[str, Any]] = {}
+        relationships: list[dict[str, Any]] = []
+        for row in records:
+            for side in ("source", "target"):
+                node_id = row.get(f"{side}_id")
+                if node_id is not None:
+                    nodes[str(node_id)] = {
+                        "id": str(node_id),
+                        "labels": row.get(f"{side}_labels") or [],
+                        "properties": row.get(f"{side}_properties") or {},
+                    }
+            if row.get("source_id") is not None and row.get("target_id") is not None:
+                relationships.append({
+                    "source": str(row["source_id"]),
+                    "target": str(row["target_id"]),
+                    "type": row.get("relationship") or "RELATED_TO",
+                })
+        return {"nodes": list(nodes.values()), "relationships": relationships}
+
+    def get_compositions(self) -> list[dict[str, Any]]:
+        """Return composition records for choosing a graph neighborhood."""
+        query = (
+            "MATCH (c:Composition) RETURN properties(c) AS composition "
+            "ORDER BY c.canonical_title, c.composition_id"
+        )
+        with self._require_driver().session() as session:
+            return self._records(session.run(query))
+
+    def get_full_graph_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        """Load every supported knowledge-graph node and all links between them."""
+        node_labels = ["Composition", "TextRecord", "AudioRecording", "Singer", "Raga", "Tala"]
+        node_query = (
+            "MATCH (node) WHERE any(label IN labels(node) WHERE label IN $node_labels) "
+            "RETURN elementId(node) AS id, labels(node) AS labels, properties(node) AS properties "
+            "ORDER BY id"
+        )
+        relationship_query = (
+            "MATCH (source)-[relationship]->(target) "
+            "WHERE any(label IN labels(source) WHERE label IN $node_labels) "
+            "AND any(label IN labels(target) WHERE label IN $node_labels) "
+            "RETURN elementId(source) AS source, elementId(target) AS target, "
+            "type(relationship) AS type, properties(relationship) AS properties "
+            "ORDER BY source, target, type"
+        )
+        with self._require_driver().session() as session:
+            node_rows = self._records(session.run(node_query, node_labels=node_labels))
+            relationship_rows = self._records(session.run(relationship_query, node_labels=node_labels))
+        return {
+            "nodes": [
+                {"id": str(row["id"]), "labels": row.get("labels") or [], "properties": row.get("properties") or {}}
+                for row in node_rows if row.get("id") is not None
+            ],
+            "relationships": [
+                {
+                    "source": str(row["source"]),
+                    "target": str(row["target"]),
+                    "type": row.get("type") or "RELATED_TO",
+                    "properties": row.get("properties") or {},
+                }
+                for row in relationship_rows if row.get("source") is not None and row.get("target") is not None
+            ],
+        }
+
+    def get_composition_neighborhood(
+        self, composition_id: str, *, hops: int = 2, limit: int = 250,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Load a bounded composition neighborhood and its real Neo4j relationships."""
+        cleaned = _value(composition_id)
+        if cleaned is None:
+            raise ValueError("composition_id must be non-empty")
+        if isinstance(hops, bool) or not isinstance(hops, int) or hops not in (1, 2):
+            raise ValueError("hops must be 1 or 2")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+
+        node_query = (
+            "MATCH (c:Composition {composition_id: $composition_id})-[*0.." + str(hops) + "]-(n) "
+            "RETURN DISTINCT elementId(n) AS id, labels(n) AS labels, properties(n) AS properties "
+            "LIMIT $limit"
+        )
+        relationship_query = (
+            "MATCH p=(c:Composition {composition_id: $composition_id})-[*1.." + str(hops) + "]-(n) "
+            "UNWIND relationships(p) AS relationship "
+            "RETURN DISTINCT elementId(startNode(relationship)) AS source, "
+            "elementId(endNode(relationship)) AS target, type(relationship) AS type "
+            "LIMIT $limit"
+        )
+        with self._require_driver().session() as session:
+            node_rows = self._records(session.run(node_query, composition_id=cleaned, limit=limit))
+            relationship_rows = self._records(session.run(relationship_query, composition_id=cleaned, limit=limit))
+        return {
+            "nodes": [
+                {"id": str(row["id"]), "labels": row.get("labels") or [], "properties": row.get("properties") or {}}
+                for row in node_rows if row.get("id") is not None
+            ],
+            "relationships": [
+                {"source": str(row["source"]), "target": str(row["target"]), "type": row.get("type") or "RELATED_TO"}
+                for row in relationship_rows if row.get("source") is not None and row.get("target") is not None
+            ],
+        }
+
     def close(self) -> None:
         """Close and release the underlying Neo4j driver, if any."""
         if self.driver is not None:
