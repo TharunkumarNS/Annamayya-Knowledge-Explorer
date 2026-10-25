@@ -10,6 +10,7 @@ import pandas as pd
 
 import app
 from app import (
+    _force_directed_positions,
     _excerpt,
     _local_recording_path,
     _metadata_line,
@@ -127,6 +128,24 @@ class FakeExplainer:
 
 
 class AppHelperTests(unittest.TestCase):
+    def test_force_directed_graph_layout_is_deterministic_and_spreads_nodes(self):
+        nodes = [{"id": node_id} for node_id in ("composition", "text", "singer", "raga", "audio")]
+        edges = [
+            {"source": "composition", "target": "text"},
+            {"source": "composition", "target": "singer"},
+            {"source": "composition", "target": "raga"},
+            {"source": "composition", "target": "audio"},
+        ]
+        positions = _force_directed_positions(nodes, edges)
+        self.assertEqual(positions, _force_directed_positions(nodes, edges))
+        points = list(positions.values())
+        distances = [
+            ((first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2) ** 0.5
+            for index, first in enumerate(points)
+            for second in points[index + 1:]
+        ]
+        self.assertGreater(min(distances), 0.1)
+
     def test_result_render_shows_correct_local_text_and_existing_audio(self):
         from data_loader import load_normalized_data
 

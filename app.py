@@ -12,11 +12,17 @@ import html
 import logging
 import os
 from pathlib import Path
+import random
 import tempfile
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
 import pandas as pd
+import math
+try:
+    import plotly.graph_objects as go
+except ImportError:  # Keep non-visual app helpers and tests usable without Plotly installed.
+    go = None
 
 try:
     import streamlit as st
@@ -362,22 +368,345 @@ def _render_details(data: dict[str, Any], composition_id: str) -> None:
     _render_source_links(composition)
 
 
+
 def _render_graph_data(graph_data: Any) -> None:
     if not isinstance(graph_data, dict):
         return
-    st.markdown("**Verified graph relationships**")
+    if go is None:
+        st.info("Install Plotly from the project requirements to display this graph.")
+        st.json(graph_data)
+        return
+
+    st.markdown("**Interactive knowledge graph**")
+
     composition = graph_data.get("composition") or {}
-    if composition:
+    if not isinstance(composition, dict):
+        composition = {"title": str(composition)}
+
+    nodes = []
+    edges = []
+
+    title = (
+        composition.get("canonical_title")
+        or composition.get("title")
+        or composition.get("composition_id")
+        or "Selected composition"
+    )
+
+    nodes.append({
+        "id": "composition",
+        "label": str(title),
+        "group": "Composition",
+        "details": composition,
+    })
+
+    categories = [
+        ("Singers", "singers"),
+        ("Ragas", "ragas"),
+        ("Talas", "talas"),
+        ("Text records", "text_records"),
+        ("Recordings", "audio_records"),
+    ]
+
+    for label, key in categories:
+        values = graph_data.get(key) or []
+
+        for index, value in enumerate(values):
+            if not value:
+                continue
+
+            details = value if isinstance(value, dict) else {"name": str(value)}
+
+            display = (
+                details.get("content")
+                or details.get("name")
+                or details.get("recording_title")
+                or details.get("canonical_title")
+                or details.get("text_type")
+                or details.get("audio_id")
+                or details.get("text_id")
+                or str(value)
+            )
+
+            node_id = f"{key}_{index}"
+
+            nodes.append({
+                "id": node_id,
+                "label": str(display).replace("\n", " ")[:45],
+                "group": label,
+                "details": details,
+            })
+
+            edges.append(("composition", node_id))
+
+    if len(nodes) == 1:
+        st.info("No linked records were supplied for this composition.")
         st.json(composition)
-    for label, key in (("Singers", "singers"), ("Ragas", "ragas"), ("Talas", "talas")):
-        values = [value for value in (graph_data.get(key) or []) if value]
-        if values:
-            st.write(f"**{label}:** {', '.join(map(str, values))}")
-    for label, key in (("Text records", "text_records"), ("Recordings", "audio_records")):
-        values = [value for value in (graph_data.get(key) or []) if value]
-        if values:
-            st.write(f"**{label}:** {len(values)} linked")
-            st.json(values)
+        return
+
+    positions = {"composition": (0.0, 0.0)}
+
+    for index, node in enumerate(nodes[1:]):
+        angle = 2 * math.pi * index / (len(nodes) - 1)
+        positions[node["id"]] = (
+            1.5 * math.cos(angle),
+            1.5 * math.sin(angle),
+        )
+
+    edge_x, edge_y = [], []
+
+    for source, target in edges:
+        x0, y0 = positions[source]
+        x1, y1 = positions[target]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        mode="lines",
+        line={"width": 1, "color": "#999999"},
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+    palette = {
+        "Composition": "#E69F00",
+        "Singers": "#56B4E9",
+        "Ragas": "#009E73",
+        "Talas": "#CC79A7",
+        "Text records": "#0072B2",
+        "Recordings": "#D55E00",
+    }
+
+    node_x, node_y, colors, hover_text, sizes = [], [], [], [], []
+
+    for node in nodes:
+        x, y = positions[node["id"]]
+        node_x.append(x)
+        node_y.append(y)
+        colors.append(palette.get(node["group"], "#999999"))
+        sizes.append(30 if node["id"] == "composition" else 20)
+
+        details = node["details"]
+        extra = "<br>".join(
+            f"{key}: {str(value)[:150]}"
+            for key, value in details.items()
+            if value is not None and str(value).strip()
+        )
+
+        hover_text.append(
+            f"<b>{node['group']}</b><br>{node['label']}<br>{extra}"
+        )
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=[node["label"] for node in nodes],
+        textposition="top center",
+        hovertext=hover_text,
+        hoverinfo="text",
+        marker={
+            "size": sizes,
+            "color": colors,
+            "line": {"width": 1, "color": "white"},
+        },
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        title="Composition and linked records",
+        height=650,
+        showlegend=False,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        hovermode="closest",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("View original graph data"):
+        st.json(graph_data)
+
+
+def _force_directed_positions(nodes: list[dict[str, Any]], relationships: list[dict[str, Any]]) -> dict[str, tuple[float, float]]:
+    """Compute a deterministic Fruchterman-Reingold style layout."""
+    node_ids = [str(node["id"]) for node in nodes]
+    if not node_ids:
+        return {}
+    randomizer = random.Random(17)
+    count = len(node_ids)
+    positions = {
+        node_id: [math.cos(2 * math.pi * index / count) + randomizer.uniform(-0.08, 0.08),
+                  math.sin(2 * math.pi * index / count) + randomizer.uniform(-0.08, 0.08)]
+        for index, node_id in enumerate(node_ids)
+    }
+    edges = [(str(edge["source"]), str(edge["target"])) for edge in relationships
+             if str(edge.get("source")) in positions and str(edge.get("target")) in positions]
+    area = max(4.0, count * 0.8)
+    optimal_distance = math.sqrt(area / count)
+    temperature = optimal_distance * 1.5
+
+    for iteration in range(180):
+        displacement = {node_id: [0.0, 0.0] for node_id in node_ids}
+        for index, first in enumerate(node_ids):
+            for second in node_ids[index + 1:]:
+                dx = positions[first][0] - positions[second][0]
+                dy = positions[first][1] - positions[second][1]
+                distance = max(math.hypot(dx, dy), 0.01)
+                force = optimal_distance * optimal_distance / distance
+                fx, fy = dx / distance * force, dy / distance * force
+                displacement[first][0] += fx
+                displacement[first][1] += fy
+                displacement[second][0] -= fx
+                displacement[second][1] -= fy
+        for source, target in edges:
+            dx = positions[source][0] - positions[target][0]
+            dy = positions[source][1] - positions[target][1]
+            distance = max(math.hypot(dx, dy), 0.01)
+            force = distance * distance / optimal_distance
+            fx, fy = dx / distance * force, dy / distance * force
+            displacement[source][0] -= fx
+            displacement[source][1] -= fy
+            displacement[target][0] += fx
+            displacement[target][1] += fy
+        temperature = optimal_distance * 1.5 * (1 - (iteration + 1) / 180)
+        for node_id in node_ids:
+            dx, dy = displacement[node_id]
+            magnitude = max(math.hypot(dx, dy), 0.01)
+            step = min(magnitude, temperature)
+            positions[node_id][0] += dx / magnitude * step
+            positions[node_id][1] += dy / magnitude * step
+
+    return {node_id: (point[0], point[1]) for node_id, point in positions.items()}
+
+
+def _render_graph_snapshot(snapshot: dict[str, Any]) -> None:
+    """Draw a focused Neo4j neighborhood with node and relationship hover details."""
+    if go is None:
+        st.error("Plotly is required for the Connections graph. Install the project requirements and restart the app.")
+        return
+    nodes = snapshot.get("nodes") or []
+    relationships = snapshot.get("relationships") or []
+    if not nodes:
+        st.info("Neo4j is reachable, but it has no connected nodes to display yet.")
+        return
+
+    palette = {
+        "Composition": "#a77724", "Singer": "#477b9e", "Raga": "#43866e",
+        "Tala": "#9b6383", "TextRecord": "#5876a1", "AudioRecording": "#bd684c",
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        labels = node.get("labels") or ["Node"]
+        grouped.setdefault(str(labels[0]), []).append(node)
+
+    groups = list(grouped.items())
+    positions = _force_directed_positions(nodes, relationships)
+
+    edge_x: list[Any] = []
+    edge_y: list[Any] = []
+    edge_labels: list[str] = []
+    edge_mid_x: list[float] = []
+    edge_mid_y: list[float] = []
+    edge_hover: list[str] = []
+    for edge in relationships:
+        source, target = str(edge.get("source")), str(edge.get("target"))
+        if source not in positions or target not in positions:
+            continue
+        x0, y0 = positions[source]
+        x1, y1 = positions[target]
+        edge_x.extend((x0, x1, None))
+        edge_y.extend((y0, y1, None))
+        edge_labels.append(str(edge.get("type", "RELATED_TO")))
+        edge_mid_x.append((x0 + x1) / 2)
+        edge_mid_y.append((y0 + y1) / 2)
+        relation_properties = edge.get("properties") or {}
+        relation_details = "<br>".join(
+            f"{html.escape(str(key))}: {html.escape(str(value))}"
+            for key, value in relation_properties.items() if value is not None
+        )
+        edge_hover.append("<b>Relationship: " + html.escape(str(edge.get("type", "RELATED_TO"))) + "</b>" + ("<br>" + relation_details if relation_details else ""))
+
+    traces = [go.Scatter(x=edge_x, y=edge_y, mode="lines", line={"width": 1.5, "color": "#b7ad9a"}, hoverinfo="skip", showlegend=False)]
+    if edge_labels:
+        traces.append(go.Scatter(x=edge_mid_x, y=edge_mid_y, mode="markers+text", text=edge_labels, textposition="middle center", textfont={"size": 9, "color": "#625e52"}, hovertext=edge_hover, hoverinfo="text", marker={"size": 7, "color": "#b7ad9a", "opacity": 0.01}, showlegend=False))
+    for label, members in groups:
+        xs, ys, texts, hovers = [], [], [], []
+        for node in members:
+            x, y = positions[str(node["id"])]
+            props = node.get("properties") or {}
+            title = (props.get("canonical_title") or props.get("name") or props.get("text_type") or props.get("recording_title") or props.get("composition_id") or props.get("text_id") or props.get("audio_id") or label)
+            short_title = " ".join(str(title).split())
+            texts.append(short_title if len(short_title) <= 22 else short_title[:20] + "…")
+            property_lines = "<br>".join(f"{html.escape(str(key))}: {html.escape(str(value))}" for key, value in props.items() if value is not None)
+            hovers.append("<b>" + html.escape(label) + "</b><br>" + html.escape(str(title)) + ("<br>" + property_lines if property_lines else ""))
+            xs.append(x)
+            ys.append(y)
+        traces.append(go.Scatter(x=xs, y=ys, mode="markers+text", text=texts, textposition="top center", hovertext=hovers, hoverinfo="text", name=label, marker={"size": 28 if label == "Composition" else 17, "symbol": "diamond" if label == "Composition" else "circle", "color": palette.get(label, "#888888"), "line": {"width": 1.5, "color": "white"}}))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(height=760, plot_bgcolor="#fffefa", paper_bgcolor="#fffefa", hovermode="closest", dragmode="pan", margin={"l": 20, "r": 20, "t": 20, "b": 20}, legend={"orientation": "h", "y": -0.04}, xaxis={"visible": False}, yaxis={"visible": False, "scaleanchor": "x", "scaleratio": 1})
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True, "staticPlot": False})
+    st.caption("Drag the background to pan, scroll to zoom, and hover over nodes or relationship markers for details.")
+
+
+def _render_connections(settings: dict[str, Any]) -> None:
+    st.markdown("### Connections")
+    st.caption("Explore the full knowledge graph or focus on one composition.")
+    if not (settings["graph_uri"] and settings["graph_username"] and settings["graph_password"]):
+        st.info("Neo4j is not configured. Set NEO4J_URI, NEO4J_USERNAME (or NEO4J_USER), and NEO4J_PASSWORD, then restart the app.")
+        return
+    from knowledge_graph import AnnamayyaKnowledgeGraph
+    graph = AnnamayyaKnowledgeGraph(uri=settings["graph_uri"], username=settings["graph_username"], password=settings["graph_password"])
+    try:
+        graph.connect()
+        mode = st.sidebar.radio(
+            "Graph view",
+            ["Full Knowledge Graph", "Single Song Explorer"],
+            key="connections_graph_mode",
+        )
+        if mode == "Full Knowledge Graph":
+            snapshot = graph.get_full_graph_snapshot()
+            composition_id = None
+            hops = None
+        else:
+            compositions = [row.get("composition") or {} for row in graph.get_compositions()]
+            compositions = [row for row in compositions if row.get("composition_id")]
+            if not compositions:
+                st.info("Neo4j is reachable, but no Composition nodes were found for the song explorer.")
+                return
+            by_id = {str(row["composition_id"]): row for row in compositions}
+            composition_id = st.sidebar.selectbox(
+                "Focus composition",
+                options=list(by_id),
+                format_func=lambda value: f"{by_id[value].get('canonical_title') or value} · {value}",
+                key="connections_composition_id",
+            )
+            hops = st.sidebar.selectbox("Neighborhood depth", [1, 2], index=0, format_func=lambda value: f"{value} hop{'s' if value > 1 else ''}", key="connections_hops")
+            snapshot = graph.get_composition_neighborhood(composition_id, hops=hops, limit=250)
+    except Exception as exc:
+        LOGGER.warning("Could not load Neo4j graph: %s", type(exc).__name__)
+        st.error("Neo4j could not be reached. Check the URI, credentials, and that the database is running.")
+        return
+    finally:
+        graph.close()
+    if not snapshot["nodes"]:
+        st.info("Neo4j is reachable, but the database contains no graph nodes to display.")
+        return
+    node_count = len(snapshot["nodes"])
+    edge_count = len(snapshot["relationships"])
+    if composition_id is None:
+        composition_count = sum("Composition" in (node.get("labels") or []) for node in snapshot["nodes"])
+        st.caption(f"Full graph: {composition_count} compositions, {node_count} total nodes, and {edge_count} relationships.")
+    else:
+        st.caption(f"Neighborhood for {by_id[composition_id].get('canonical_title') or composition_id}: {node_count} nodes and {edge_count} relationships across {hops} hop{'s' if hops > 1 else ''} (up to 250 nodes and relationships).")
+    _render_graph_snapshot(snapshot)
 
 
 def _metadata_line(metadata: dict[str, Any]) -> str:
@@ -827,6 +1156,10 @@ def main() -> None:
     st.markdown(THEME_CSS, unsafe_allow_html=True)
     _render_header()
     settings = _sidebar_settings()
+    destination = st.sidebar.radio("Explore", ["Discover", "Connections"], key="app_destination", horizontal=True)
+    if destination == "Connections":
+        _render_connections(settings)
+        return
     try:
         with st.spinner("Preparing the text and audio indexes…"):
             data = initialize_engines(compute_dataset_fingerprint())
