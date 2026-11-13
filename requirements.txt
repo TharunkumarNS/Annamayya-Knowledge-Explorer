@@ -5,4 +5,5 @@ sentence-transformers
 soundfile
 neo4j
 streamlit>=1.32
+plotly>=5.18
 google-genai>=2.3.0
