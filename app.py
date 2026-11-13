@@ -787,17 +787,10 @@ def _render_ai_explanation(data: dict[str, Any]) -> None:
                         "evidence": evidence, "evidence_fingerprint": fingerprint, "prepared_demo": False,
                     }
                 except GeminiExplanationError as exc:
-                    if _is_demo_request(question, selected_id, result_by_id):
-                        st.session_state["ai_explanation"] = {
-                            "answer": DEMO_ANSWER, "model": "Prepared demo explanation", "usage": {},
-                            "question": question.strip(), "request_identity": request_identity,
-                            "evidence": evidence, "evidence_fingerprint": fingerprint, "prepared_demo": True,
-                        }
-                    else:
-                        st.info("Live AI responses are temporarily unavailable. Please try again later.")
+                    st.error(f"Gemini explanation error: {exc}")
                 except Exception as exc:
-                    LOGGER.exception("Unexpected explanation-layer failure.")
-                    st.error(f"Gemini explanation failed ({type(exc).__name__}). Search results are unchanged; you can retry.")
+                    LOGGER.exception("Unexpected explanation-layout failure.")
+                    st.error(f"Gemini explanation failed ({type(exc).__name__}). search results are unchanged.")
                 finally:
                     service.close()
 
