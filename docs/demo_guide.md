@@ -1,73 +1,26 @@
-# Seven-minute demonstration guide
+# Local Demo Guide
 
-This guide uses the actual local package. It does not assume that optional hosted services are configured.
+## Start the web app
 
-## Before the demo
-
-From the project root, install `requirements.txt`, then run:
+From the project root, install dependencies and start the FastAPI server:
 
 ```powershell
-python scripts/validate_data.py
-python -m unittest -v
-python -m streamlit run app.py
+python -m pip install -r requirements.txt
+uvicorn app:app --reload
 ```
 
-The first LaBSE use needs model weights available locally or internet access. This project's current environment did not have Streamlit, cached LaBSE weights, a Gemini API key/SDK, or Neo4j configuration, so those workflows were not browser/live-service verified here. If those are unavailable during a presentation, use the backend commands below and describe them as a CLI fallback, not as UI proof.
+Open <http://127.0.0.1:8000>. The frontend is plain HTML, CSS, and JavaScript. FastAPI serves the page and API from the same local origin. On the first request, the normalized tables are created in `data/annamayya.sqlite3` from the packaged workbook.
 
-## 0:00–0:45 — Problem and architecture
+## Discover compositions
 
-Explain that the application organizes a 25-composition dataset into source-aware text and audio records. Text retrieval uses LaBSE; audio retrieval computes actual MFCC-like/chroma features; multimodal results use weighted reciprocal-rank fusion. Neo4j and Gemini are optional enrichments and do not determine the core candidates.
+Enter Telugu, Romanized Telugu, or English text and select **Find compositions**. For acoustic similarity, attach a WAV or MP3 file; a text query and audio file can be submitted together. Each result shows its match type, available lyrics/meaning excerpts, metadata, sources, and local recording player. **Full lyrics & song details** opens all local text and recording rows. **Why this result?** shows branch ranks and scores; the scores are ranking signals, not probabilities.
 
-## 0:45–1:45 — Text retrieval
+The first text search initializes LaBSE and can take longer while model weights are fetched. Audio search builds its feature index from the packaged recordings.
 
-Use a real lyric snippet for `ANN-001` (Adivo Alladivo):
+## Optional services
 
-```powershell
-python text_retrieval.py "adivō alladivō harivāsamu" --top-k 5
-```
+Set `NEO4J_URI`, `NEO4J_USERNAME` (or `NEO4J_USER`), and `NEO4J_PASSWORD` before starting the server to enable search enrichment and the Connections graph. Set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` to enable explanations for returned search results. The UI reports when a service is unavailable; local search does not require either service.
 
-The source workbook associates Romanized lyrics with Vignanam and Telugu lyrics with TemplesinIndiaInfo. Inspect the returned text record and cosine score as a similarity—not a probability. If model weights cannot load, show the unit test instead and disclose the missing model runtime; do not show made-up results.
+## Data and API
 
-## 1:45–2:45 — Audio retrieval
-
-Use a recording that exists in the package:
-
-```powershell
-python audio_retrieval.py "Recordings/audio001.mp3" --top-k 5
-```
-
-The current verified exact-file smoke check decoded the MP3, built a one-recording real feature index, and returned `ANN-001` / `R001` at cosine similarity 1.0. Explain that this proves the decode-feature-rank-ID path for an exact recording only; the fixed statistics do not establish cross-performance music recognition.
-
-## 2:45–3:45 — Multimodal retrieval
-
-With LaBSE weights available, search both actual modalities:
-
-```powershell
-python multimodal_retrieval.py --text "adivō alladivō harivāsamu" --audio "Recordings/audio001.mp3" --top-k 5
-```
-
-Inspect each branch rank/evidence and the fused score. The default weights (`text=0.6`, `audio=0.4`) are starting settings, not tuned accuracy guarantees. If text initialization fails, the app should identify that branch failure; do not call an audio-only fallback “multimodal.”
-
-## 3:45–4:30 — Knowledge graph
-
-If Neo4j is running and credentials are configured, set `NEO4J_URI`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD`; use `python multimodal_retrieval.py --text "..." --import-graph` to import supported dataset relationships, then add `--graph` to retrieve graph enrichment. The graph tests are mocked in this environment; a live relationship should only be demonstrated after an actual connection and query.
-
-Without Neo4j, show the local composition metadata and report that graph enrichment is unavailable. Core search remains local.
-
-## 4:30–5:15 — Gemini explanation
-
-Set `GEMINI_API_KEY` in the launching shell, search first, select an evidence set, then explicitly submit an explanation question in the app. Only selected retrieved evidence and the question are sent to Google's Gemini API. The generated explanation is interpretation, not verified translation or historical fact. Mocked tests cover the client behavior; this environment has no key or SDK, so a live request was not tested.
-
-## 5:15–6:15 — Evaluation
-
-Run:
-
-```powershell
-python scripts/evaluate_retrieval.py --prepare --skip-text
-```
-
-Open `docs/evaluation_report.md` and the per-query CSV. The 13 audio cases use exact recordings already present in the index; the audio self-match result is intentionally labeled in-sample and cannot be presented as a general accuracy score. LaBSE-dependent rows are explicitly failures when skipped. The package contains no independent, held-out query recordings.
-
-## 6:15–7:00 — Limitations and close
-
-Disclose the one missing audio file (`audio025.mp3`), sparse English translations (10 records), missing tala for 24 compositions, small coverage, audio feature limitations, and lack of independent holdout. Neo4j and Gemini are optional and need live configuration. The app/browser workflow was not exercised in the current environment because Streamlit is not installed.
+`GET /api/health` reports table counts and optional service configuration. `POST /api/search` accepts multipart form data. `GET /api/compositions/{composition_id}` returns source rows; `GET /api/connections` returns Neo4j links; and `POST /api/explain` generates an evidence-grounded answer. See the project README for request fields and SQL table details.
