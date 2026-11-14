@@ -6,14 +6,13 @@
   <meta name="theme-color" content="#f7f5ef">
   <title>Annamayya Knowledge Explorer</title>
   <link rel="stylesheet" href="/static/styles.css">
-  <link rel="stylesheet" href="/vendor/vis-network.css">
-  <script defer src="/vendor/vis-network.min.js"></script>
   <script defer src="/static/app.js"></script>
+  <script defer src="/static/remix.js"></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/"><span class="brand-mark">♪</span><span>Annamayya <small>Knowledge Explorer</small></span></a>
-    <nav aria-label="Main navigation"><button class="nav-link active" data-view="discover">Discover</button><button class="nav-link" data-view="merge">Generational Duet</button><button class="nav-link" data-view="connections">Connections</button></nav>
+    <nav aria-label="Main navigation"><button class="nav-link active" data-view="discover">Discover</button><button class="nav-link" data-view="merge">Generational Duet</button><button class="nav-link" data-view="remix">Remix Studio</button></nav>
     <div id="service-status" class="service-status">Connecting…</div>
   </header>
   <main>
@@ -31,7 +30,6 @@
         <div class="search-row"><input id="query" name="text_query" placeholder="A song title, lyric, theme, or meaning…" autocomplete="off"><button id="search-button" type="submit">Find compositions <span>→</span></button></div>
         <div class="search-options">
           <label class="file-control" for="audio"><span class="file-icon">＋</span><span id="audio-label">Add an audio recording <small>WAV or MP3</small></span><input id="audio" name="audio" type="file" accept="audio/wav,audio/mpeg,.wav,.mp3"></label>
-          <label id="graph-option" class="check-control" hidden><input id="enrich-graph" type="checkbox"><span>Add knowledge-graph details</span></label>
         </div>
       </form>
       <div id="search-message" class="message" role="status" hidden></div>
@@ -62,18 +60,26 @@
       <section id="duet-output" class="duet-output" hidden><h2>Generated duet</h2><audio id="duet-result" controls></audio><a id="duet-download" class="download-link" download="generational_duet.wav">Download WAV</a></section>
     </section>
 
-    <section id="connections-view" class="view" hidden>
-      <div class="section-heading"><div><div class="eyebrow">Knowledge graph</div><h2>Connections</h2></div><p>Explore the connected compositions and source records in the configured Neo4j graph.</p></div>
-      <form id="connections-form" class="search-panel compact">
-        <label for="graph-mode">Explore</label><div class="search-row connection-controls">
-          <select id="graph-mode"><option value="all">Full graph</option><option value="composition">One composition</option><option value="singer">Find by singer</option><option value="raga">Find by raga</option><option value="tala">Find by tala</option></select>
-          <input id="graph-value" placeholder="Composition ID or exact metadata value" hidden>
-          <button type="submit">Load connections <span>→</span></button>
+    <section id="remix-view" class="view" hidden>
+      <div class="section-heading"><div><div class="eyebrow">A modern touch</div><h2>Remix Studio</h2></div><p>Give a recording a modern sound live in your browser. Speed changes pitch too, like a record, so slower sounds deeper.</p></div>
+      <div class="search-panel">
+        <label for="remix-song">Recording</label>
+        <select id="remix-song" class="remix-select"></select>
+        <div id="remix-meta" class="metadata"></div>
+        <audio id="remix-audio" controls preload="auto"></audio>
+        <canvas id="remix-viz" width="900" height="110" aria-label="Live spectrum"></canvas>
+        <div class="eyebrow remix-label">Style</div>
+        <div id="remix-presets" class="preset-row"></div>
+        <div id="remix-sliders" class="slider-grid"></div>
+        <div class="remix-actions">
+          <label class="check-control"><input id="remix-on" type="checkbox" checked><span>Remix on (untick to compare with the original)</span></label>
+          <button id="remix-export" type="button" class="subtle-button">Download remix (WAV)</button>
         </div>
-      </form>
-      <div id="connection-message" class="message" role="status" hidden></div>
-      <div id="graph-summary" class="graph-summary" hidden></div><div id="graph-canvas" class="graph-canvas" aria-label="Interactive knowledge graph"></div>
+        <div id="remix-message" class="message" role="status" hidden></div>
+        <p class="remix-note">A creative reinterpretation of the recording, not the traditional rendition. Use only recordings you have permission to adapt.</p>
+      </div>
     </section>
+
     <footer><span>Multimodal Annamayya Knowledge Explorer</span><span id="collection-stats"></span></footer>
   </main>
   <dialog id="details-dialog"><button class="dialog-close" aria-label="Close">×</button><div id="details-content"></div></dialog>

@@ -19,8 +19,8 @@ The first text search initializes LaBSE and can take longer while model weights 
 
 ## Optional services
 
-Set `NEO4J_URI`, `NEO4J_USERNAME` (or `NEO4J_USER`), and `NEO4J_PASSWORD` before starting the server to enable search enrichment and the Connections graph. Set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` to enable explanations for returned search results. The UI reports when a service is unavailable; local search does not require either service.
+Neo4j setup is not required; the Connections page and graph enrichment control are removed. Set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` only if you want Gemini explanations.
 
 ## Data and API
 
-`GET /api/health` reports table counts and optional service configuration. `POST /api/search` accepts multipart form data. `GET /api/compositions/{composition_id}` returns source rows; `GET /api/connections` returns Neo4j links; and `POST /api/explain` generates an evidence-grounded answer. See the project README for request fields and SQL table details.
+`GET /api/health` reports table counts and optional Gemini configuration. `POST /api/search` accepts multipart form data. `GET /api/compositions/{composition_id}` returns source rows; and `POST /api/explain` generates an evidence-grounded answer. See the project README for request fields and SQL table details.
