@@ -10,10 +10,10 @@ Use Python 3.10 or later. From this directory:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-uvicorn app:app --reload
+uvicorn app:app --reload --port 1234
 ```
 
-Open <http://127.0.0.1:8000>. On first startup, the app normalizes `annamayya_dataset_package/Annamayya_25_Song_Dataset.xlsx` into `data/annamayya.sqlite3`. The original workbook and recordings remain the source package. Set `ANNAMAYYA_DATABASE` to use a different SQLite file.
+Open <http://127.0.0.1:1234>. On first startup, the app normalizes `annamayya_dataset_package/Annamayya_25_Song_Dataset.xlsx` into `data/annamayya.sqlite3`. The original workbook and recordings remain the source package. Set `ANNAMAYYA_DATABASE` to use a different SQLite file.
 
 The first text search initializes the LaBSE sentence-transformer and may download its model weights. Audio indexing reads the packaged recordings when the backend starts initializing retrieval.
 
@@ -37,7 +37,7 @@ $env:NEO4J_USERNAME="neo4j"
 $env:NEO4J_PASSWORD="your-password"
 $env:GEMINI_API_KEY="your-google-ai-studio-key"
 $env:GEMINI_MODEL="gemini-3.8-flash"
-uvicorn app:app --reload
+uvicorn app:app --reload --port 1234
 ```
 
 ## SQL tables

@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+generational_duet/output/
+generational_duet/ping_pong_duet.wav
