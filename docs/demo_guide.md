@@ -6,10 +6,10 @@ From the project root, install dependencies and start the FastAPI server:
 
 ```powershell
 python -m pip install -r requirements.txt
-uvicorn app:app --reload
+uvicorn app:app --reload --port 1234
 ```
 
-Open <http://127.0.0.1:8000>. The frontend is plain HTML, CSS, and JavaScript. FastAPI serves the page and API from the same local origin. On the first request, the normalized tables are created in `data/annamayya.sqlite3` from the packaged workbook.
+Open <http://127.0.0.1:1234>. The frontend is plain HTML, CSS, and JavaScript. FastAPI serves the page and API from the same local origin. On the first request, the normalized tables are created in `data/annamayya.sqlite3` from the packaged workbook.
 
 ## Discover compositions
 

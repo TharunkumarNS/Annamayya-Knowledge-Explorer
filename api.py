@@ -7,10 +7,11 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import uuid
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -20,10 +21,14 @@ from gemini_explainer import GeminiExplainer, prepare_evidence
 from multimodal_retrieval import MultimodalRetrievalEngine
 from sql_store import DATABASE_PATH, database_stats, initialize_database, load_sql_data
 from text_retrieval import build_engine as build_text_engine
+from duet_store import get_pair, list_available_pairs
+from duet_processing import create_duet_audio
 
 LOGGER = logging.getLogger("annamayya_api")
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = PROJECT_ROOT / "frontend"
+DUET_OUTPUT_DIR = PROJECT_ROOT / "generational_duet" / "output"
+DUET_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _data: dict[str, Any] = {}
 
 
@@ -61,6 +66,7 @@ app = FastAPI(title="Annamayya Knowledge Explorer API", version="1.0.0", lifespa
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/vendor", StaticFiles(directory=PROJECT_ROOT / "lib" / "vis-9.1.2"), name="vendor")
 app.mount("/media", StaticFiles(directory=DATASET_DIR / "Recordings"), name="recordings")
+app.mount("/duet-output", StaticFiles(directory=DUET_OUTPUT_DIR), name="duet-output")
 
 
 def get_data() -> dict[str, Any]:
@@ -102,23 +108,6 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "database": str(DATABASE_PATH.name), "tables": database_stats(),
             "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
             "neo4j_configured": bool(os.getenv("NEO4J_URI") and (os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER")) and os.getenv("NEO4J_PASSWORD"))}
-
-
-@app.get("/api/recordings")
-def recordings() -> dict[str, Any]:
-    """Playable packaged recordings, used by the Remix Studio song picker."""
-    compositions, _texts, audio = load_sql_data()
-    titles = dict(zip(compositions["composition_id"].astype(str), compositions["canonical_title"]))
-    rows = []
-    for record in audio.to_dict("records"):
-        filename = Path(str(record.get("audio_path", "")).replace("\\", "/")).name
-        if not filename or not (DATASET_DIR / "Recordings" / filename).is_file():
-            continue
-        composition_id = str(record.get("composition_id", ""))
-        rows.append({"audio_id": record.get("audio_id"), "composition_id": composition_id, "file": filename,
-                     "title": record.get("recording_title") or titles.get(composition_id) or filename,
-                     "singer": record.get("singer"), "raga": record.get("raga"), "tala": record.get("tala")})
-    return json_safe({"recordings": rows})
 
 
 @app.post("/api/search")
@@ -227,6 +216,63 @@ class ExplanationRequest(BaseModel):
     composition_id: str
     results: list[dict[str, Any]]
     history: list[dict[str, str]] = Field(default_factory=list)
+
+
+class DuetMergeRequest(BaseModel):
+    crossfade_duration_ms: int | None = Field(default=None, ge=1, le=30_000)
+    bell_gain_db: float = Field(default=-4.0, ge=-30.0, le=12.0)
+
+
+@app.get("/api/duets/pairs")
+def duet_pairs() -> dict[str, Any]:
+    try:
+        pairs = list_available_pairs()
+    except Exception as exc:
+        LOGGER.exception("Could not load duet pair catalog")
+        raise HTTPException(503, "Duet pair catalog is unavailable.") from exc
+    return {"pairs": [{
+        "pair_id": pair["pair_id"],
+        "display_name": pair["display_name"],
+        "composition_id": pair["composition_id"],
+        "crossfade_duration_ms": pair["crossfade_duration_ms"],
+    } for pair in pairs]}
+
+
+@app.get("/api/duets/pairs/{pair_id}/track/{version}")
+def duet_track(pair_id: int, version: str) -> FileResponse:
+    if version not in {"vintage", "modern"}:
+        raise HTTPException(404, "Track version must be vintage or modern.")
+    pair = get_pair(pair_id)
+    if pair is None:
+        raise HTTPException(404, "Merge-ready audio pair not found or its files are missing.")
+    audio_path = pair[f"{version}_audio_path"]
+    return FileResponse(audio_path, media_type="audio/mpeg", filename=audio_path.name)
+
+
+@app.post("/api/duets/pairs/{pair_id}/merge")
+def merge_duet(pair_id: int, request: DuetMergeRequest) -> dict[str, str]:
+    pair = get_pair(pair_id)
+    if pair is None:
+        raise HTTPException(404, "Merge-ready audio pair not found or its files are missing.")
+    try:
+        wav_bytes = create_duet_audio(
+            pair,
+            crossfade_ms=request.crossfade_duration_ms,
+            bell_gain_db=request.bell_gain_db,
+        )
+    except (ValueError, TypeError, FileNotFoundError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        LOGGER.exception("Duet merge failed for pair %s", pair_id)
+        raise HTTPException(500, f"Duet merge failed ({type(exc).__name__}).") from exc
+    filename = f"generational_duet_{pair_id}_{uuid.uuid4().hex[:10]}.wav"
+    output_file = DUET_OUTPUT_DIR / filename
+    try:
+        output_file.write_bytes(wav_bytes)
+    except OSError as exc:
+        LOGGER.exception("Could not save duet output")
+        raise HTTPException(500, "Could not save the merged audio file.") from exc
+    return {"audio_url": f"/duet-output/{filename}", "filename": filename}
 
 
 @app.post("/api/explain")

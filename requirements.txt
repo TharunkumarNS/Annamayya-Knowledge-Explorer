@@ -1,4 +1,4 @@
-pandas
+uvpandas
 numpy
 openpyxl
 sentence-transformers
@@ -8,3 +8,5 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9
 google-genai>=2.3.0
+pydub>=0.25.1
+imageio-ffmpeg>=0.5
