@@ -1,0 +1,55 @@
+{
+  "source_path": "C:\\Users\\HP\\Desktop\\Annamayya\\annamayya_dataset_package\\Annamayya_25_Song_Dataset.xlsx",
+  "source_rows": 25,
+  "composition_count": 25,
+  "text_record_count": 60,
+  "text_records_by_language_and_type": {
+    "English / translation": 10,
+    "Romanized Telugu / transliteration": 25,
+    "Telugu / lyrics": 25
+  },
+  "audio_record_count": 14,
+  "audio_files_present": 13,
+  "audio_files_missing": 1,
+  "present_audio_paths": [
+    "Recordings/audio001.mp3",
+    "Recordings/audio003.mp3",
+    "Recordings/audio008.mp3",
+    "Recordings/audio009.mp3",
+    "Recordings/audio010.mp3",
+    "Recordings/audio012.mp3",
+    "Recordings/audio013.mp3",
+    "Recordings/audio015.mp3",
+    "Recordings/audio018.mp3",
+    "Recordings/audio020.mp3",
+    "Recordings/audio021.mp3",
+    "Recordings/audio022.mp3",
+    "Recordings/audio024.mp3"
+  ],
+  "missing_audio_paths": [
+    "Recordings/audio025.mp3"
+  ],
+  "duplicate_source_composition_ids": [],
+  "invalid_source_id_excel_rows": [],
+  "normalized_composition_ids_unique": true,
+  "normalized_text_ids_unique": true,
+  "normalized_audio_ids_unique": true,
+  "compositions_missing_titles": [],
+  "incomplete_optional_metadata_counts": {
+    "singer": 0,
+    "raga": 0,
+    "tala": 24
+  },
+  "source_and_verification_fields_populated": {
+    "Text source URL": 4,
+    "English transliteration source URL": 25,
+    "Telugu meaning source URL": 4,
+    "Audio source URL": 14,
+    "Notes": 25
+  },
+  "warnings": [
+    "Audio source references not present in the package: Recordings/audio025.mp3"
+  ],
+  "errors": [],
+  "status": "PASS"
+}

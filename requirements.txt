@@ -1,0 +1,10 @@
+pandas
+numpy
+openpyxl
+sentence-transformers
+soundfile
+neo4j
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+google-genai>=2.3.0

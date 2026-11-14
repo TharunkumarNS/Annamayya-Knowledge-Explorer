@@ -1,0 +1,2266 @@
+Python source bundle
+Created: 2026-10-23T11:02:01+05:30
+Files included: 10
+
+========================================================================================
+FILE: audio_retrieval.py
+========================================================================================
+"""Audio similarity retrieval for the Annamayya recording package.
+
+Each file is decoded by SoundFile to mono 22.05 kHz audio. NumPy computes the
+MFCC-like mel cepstral and chroma frame features; means and standard deviations
+produce one fixed 64-value vector per recording. L2-normalized vectors are
+ranked by cosine similarity (higher is closer). This baseline describes timbre
+and harmony, not singing transcription or guaranteed alternate-performance
+recognition. NumPy feature calculations avoid a SciPy/Librosa import stall in
+the current environment while remaining compatible with the Phase 3 baseline.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import pandas as pd
+
+from data_loader import DATASET_DIR, PROJECT_ROOT, load_normalized_data
+
+
+SAMPLE_RATE = 22_050
+N_FFT = 2_048
+HOP_LENGTH = 512
+N_MFCC = 20
+N_CHROMA = 12
+FEATURE_DIMENSION = N_MFCC * 2 + N_CHROMA * 2
+REQUIRED_AUDIO_COLUMNS = {"audio_id", "composition_id", "audio_path"}
+REQUIRED_COMPOSITION_COLUMNS = {"composition_id", "canonical_title"}
+
+
+def _load_soundfile():
+    """Import SoundFile lazily, so the module remains importable without audio extras."""
+    try:
+        import soundfile
+    except ImportError as exc:
+        raise RuntimeError(
+            "SoundFile is required for audio decoding. "
+            "Install them with: python -m pip install -r requirements.txt"
+        ) from exc
+    return soundfile
+
+
+def _hz_to_mel(frequency: np.ndarray | float) -> np.ndarray:
+    return 2595.0 * np.log10(1.0 + np.asarray(frequency) / 700.0)
+
+
+def _mel_filterbank(sample_rate: int, bins: int, filters: int = 40) -> np.ndarray:
+    """Build triangular mel filters for an rFFT power spectrum."""
+    mel_points = np.linspace(_hz_to_mel(0.0), _hz_to_mel(sample_rate / 2), filters + 2)
+    hz_points = 700.0 * (10 ** (mel_points / 2595.0) - 1.0)
+    fft_frequencies = np.linspace(0.0, sample_rate / 2, bins)
+    bank = np.zeros((filters, bins), dtype=np.float32)
+    for index in range(filters):
+        left, center, right = hz_points[index : index + 3]
+        bank[index] = np.maximum(
+            0.0,
+            np.minimum(
+                (fft_frequencies - left) / max(center - left, 1e-12),
+                (right - fft_frequencies) / max(right - center, 1e-12),
+            ),
+        )
+    return bank
+
+
+def _resample_mono(waveform: np.ndarray, source_rate: int) -> np.ndarray:
+    """Convert mono waveform to SAMPLE_RATE using block averaging or interpolation."""
+    if source_rate == SAMPLE_RATE:
+        return waveform.astype(np.float32, copy=False)
+    if source_rate % SAMPLE_RATE == 0:
+        factor = source_rate // SAMPLE_RATE
+        usable_length = len(waveform) - len(waveform) % factor
+        if usable_length:
+            return waveform[:usable_length].reshape(-1, factor).mean(axis=1).astype(np.float32)
+    output_length = max(1, round(len(waveform) * SAMPLE_RATE / source_rate))
+    source_positions = np.arange(len(waveform), dtype=np.float64)
+    target_positions = np.arange(output_length, dtype=np.float64) * source_rate / SAMPLE_RATE
+    return np.interp(target_positions, source_positions, waveform).astype(np.float32)
+
+
+def extract_audio_features(audio_path: str | Path) -> np.ndarray:
+    """Decode one recording and return its normalized, fixed-length feature vector."""
+    soundfile = _load_soundfile()
+    path = Path(audio_path)
+    try:
+        waveform, source_rate = soundfile.read(path, dtype="float32", always_2d=True)
+    except Exception as exc:
+        raise ValueError(f"Could not decode audio file '{path}': {exc}") from exc
+    if waveform.size:
+        waveform = waveform.mean(axis=1, dtype=np.float32)
+    waveform = _resample_mono(waveform, int(source_rate))
+    if waveform.size < N_FFT or not np.isfinite(waveform).all():
+        raise ValueError(f"Audio file '{path}' is empty, too short, or contains invalid samples.")
+    if not np.any(waveform):
+        raise ValueError(f"Audio file '{path}' contains only silence.")
+
+    try:
+        frames = np.lib.stride_tricks.sliding_window_view(waveform, N_FFT)[::HOP_LENGTH]
+        window = np.hanning(N_FFT).astype(np.float32)
+        mel_bank = _mel_filterbank(SAMPLE_RATE, N_FFT // 2 + 1)
+        dct = np.cos(
+            (np.pi / 40.0)
+            * (np.arange(40, dtype=np.float32) + 0.5)[None, :]
+            * np.arange(N_MFCC, dtype=np.float32)[:, None]
+        ).astype(np.float32)
+        dct[0] *= np.sqrt(1.0 / 40.0)
+        dct[1:] *= np.sqrt(2.0 / 40.0)
+        frequencies = np.fft.rfftfreq(N_FFT, d=1.0 / SAMPLE_RATE)
+        pitch_classes = np.full(frequencies.shape, -1, dtype=np.int8)
+        positive = frequencies > 0
+        midi_notes = np.rint(69 + 12 * np.log2(frequencies[positive] / 440.0)).astype(int)
+        pitch_classes[positive] = np.mod(midi_notes, N_CHROMA)
+        mfcc_batches: list[np.ndarray] = []
+        chroma_batches: list[np.ndarray] = []
+        for start in range(0, len(frames), 512):
+            frame_batch = frames[start : start + 512] * window
+            power = (np.abs(np.fft.rfft(frame_batch, axis=1)) ** 2 / N_FFT).astype(np.float32).T
+            log_mel = np.log(np.maximum(mel_bank @ power, 1e-10))
+            mfcc_batches.append(dct @ log_mel)
+            chroma = np.zeros((N_CHROMA, power.shape[1]), dtype=np.float32)
+            for pitch_class in range(N_CHROMA):
+                selected = pitch_classes == pitch_class
+                if selected.any():
+                    chroma[pitch_class] = power[selected].sum(axis=0)
+            chroma /= np.maximum(chroma.sum(axis=0, keepdims=True), 1e-10)
+            chroma_batches.append(chroma)
+        mfcc = np.concatenate(mfcc_batches, axis=1)
+        chroma = np.concatenate(chroma_batches, axis=1)
+        vector = np.concatenate(
+            [mfcc.mean(axis=1), mfcc.std(axis=1), chroma.mean(axis=1), chroma.std(axis=1)]
+        ).astype(np.float32)
+    except Exception as exc:
+        raise ValueError(f"Could not extract audio features from '{path}': {exc}") from exc
+    norm = float(np.linalg.norm(vector))
+    if vector.shape != (FEATURE_DIMENSION,) or not np.isfinite(vector).all() or norm == 0:
+        raise ValueError(f"Audio feature extraction produced an invalid vector for '{path}'.")
+    return vector / norm
+
+
+@dataclass
+class IndexStats:
+    """Counts and diagnostics for the latest index build."""
+
+    encountered: int = 0
+    indexed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    skipped_audio_ids: list[str] | None = None
+    failures: dict[str, str] | None = None
+
+
+class AudioRetrievalEngine:
+    """Build an in-memory audio-feature index and retrieve similar recordings."""
+
+    def __init__(
+        self,
+        audio_records: pd.DataFrame,
+        compositions: pd.DataFrame | None = None,
+        *,
+        dataset_dir: str | Path = DATASET_DIR,
+        feature_extractor: Callable[[str | Path], np.ndarray] | None = None,
+    ) -> None:
+        missing = sorted(REQUIRED_AUDIO_COLUMNS - set(audio_records.columns))
+        if missing:
+            raise ValueError("AudioRecords is missing required column(s): " + ", ".join(missing))
+        if audio_records["audio_id"].duplicated().any():
+            raise ValueError("AudioRecords must contain unique audio_id values.")
+        if compositions is not None:
+            missing_compositions = sorted(REQUIRED_COMPOSITION_COLUMNS - set(compositions.columns))
+            if missing_compositions:
+                raise ValueError(
+                    "Compositions is missing required column(s): " + ", ".join(missing_compositions)
+                )
+            if compositions["composition_id"].duplicated().any():
+                raise ValueError("Compositions must contain unique composition_id values.")
+        self._audio_records = audio_records.copy().reset_index(drop=True)
+        self._compositions = (
+            compositions.drop_duplicates("composition_id").set_index("composition_id")
+            if compositions is not None
+            else pd.DataFrame()
+        )
+        self.dataset_dir = Path(dataset_dir).resolve()
+        self._feature_extractor = feature_extractor or extract_audio_features
+        self._features: dict[str, np.ndarray] = {}
+        self._indexed_records: dict[str, dict[str, Any]] = {}
+        self._stats = IndexStats(skipped_audio_ids=[], failures={})
+        self._built = False
+
+    def _resolve_path(self, value: object) -> Path | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        path = Path(text)
+        if path.is_absolute():
+            return path
+        candidates = (self.dataset_dir / path, PROJECT_ROOT / path)
+        return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+
+    def build_index(self) -> dict[str, Any]:
+        """Extract and cache features for every decodable recording in AudioRecords."""
+        self._features.clear()
+        self._indexed_records.clear()
+        self._stats = IndexStats(encountered=len(self._audio_records), skipped_audio_ids=[], failures={})
+
+        known_compositions = set(self._compositions.index) if not self._compositions.empty else None
+        for _, row in self._audio_records.iterrows():
+            audio_id_value = row["audio_id"]
+            composition_value = row["composition_id"]
+            audio_id = "" if audio_id_value is None or pd.isna(audio_id_value) else str(audio_id_value).strip()
+            composition_id = (
+                "" if composition_value is None or pd.isna(composition_value)
+                else str(composition_value).strip()
+            )
+            path = self._resolve_path(row["audio_path"])
+            if not audio_id or not composition_id:
+                self._stats.failed += 1
+                self._stats.failures[audio_id or "<missing audio_id>"] = "Missing audio_id or composition_id."
+                continue
+            if known_compositions is not None and composition_id not in known_compositions:
+                self._stats.failed += 1
+                self._stats.failures[audio_id] = f"Unknown composition_id: {composition_id}"
+                continue
+            if path is None or not path.is_file():
+                self._stats.skipped += 1
+                self._stats.skipped_audio_ids.append(audio_id)
+                continue
+            try:
+                features = np.asarray(self._feature_extractor(path), dtype=np.float32).reshape(-1)
+                if features.shape != (FEATURE_DIMENSION,) or not np.isfinite(features).all():
+                    raise ValueError(
+                        f"Feature extractor must return {FEATURE_DIMENSION} finite values."
+                    )
+                norm = float(np.linalg.norm(features))
+                if norm == 0:
+                    raise ValueError("Feature extractor returned a zero vector.")
+                self._features[audio_id] = features / norm
+                self._indexed_records[audio_id] = {
+                    **row.to_dict(),
+                    "resolved_audio_path": str(path),
+                    "composition_id": composition_id,
+                }
+                self._stats.indexed += 1
+            except Exception as exc:
+                self._stats.failed += 1
+                self._stats.failures[audio_id] = str(exc)
+
+        self._built = True
+        return self.get_index_stats()
+
+    def get_index_stats(self) -> dict[str, Any]:
+        """Return counts of encountered, indexed, skipped, and failed recordings."""
+        return asdict(self._stats)
+
+    def search_audio(self, query_audio_path: str | Path, top_k: int = 10) -> list[dict[str, Any]]:
+        """Rank distinct compositions by their best recording's cosine similarity."""
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        if query_audio_path is None or pd.isna(query_audio_path) or not str(query_audio_path).strip():
+            raise ValueError("query_audio_path must identify a non-empty audio path.")
+        query_path = Path(query_audio_path)
+        if not query_path.is_absolute():
+            resolved = self._resolve_path(query_audio_path)
+            query_path = resolved if resolved is not None else query_path
+        if not query_path.is_file():
+            raise FileNotFoundError(f"Query audio file was not found: {query_path}")
+        if not self._built:
+            self.build_index()
+        if not self._features:
+            return []
+
+        query_features = np.asarray(self._feature_extractor(query_path), dtype=np.float32).reshape(-1)
+        if query_features.shape != (FEATURE_DIMENSION,) or not np.isfinite(query_features).all():
+            raise ValueError(f"Query audio must produce {FEATURE_DIMENSION} finite features.")
+        query_norm = float(np.linalg.norm(query_features))
+        if query_norm == 0:
+            raise ValueError("Query audio produced a zero feature vector.")
+        query_features /= query_norm
+
+        recording_results: list[dict[str, Any]] = []
+        for audio_id, indexed in self._indexed_records.items():
+            candidate_features = self._features[audio_id]
+            if candidate_features.shape != query_features.shape:
+                continue
+            score = float(np.dot(query_features, candidate_features))
+            if np.isfinite(score):
+                recording_results.append(
+                    {
+                        "audio_id": audio_id,
+                        "composition_id": indexed["composition_id"],
+                        "score": score,
+                        "audio_path": indexed["audio_path"],
+                        "resolved_audio_path": indexed["resolved_audio_path"],
+                        "metadata": {
+                            key: indexed.get(key)
+                            for key in ("recording_title", "singer", "raga", "tala", "source_url")
+                        },
+                    }
+                )
+        recording_results.sort(key=lambda item: (-item["score"], item["audio_id"]))
+
+        by_composition: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for result in recording_results:
+            by_composition[result["composition_id"]].append(result)
+
+        composition_results: list[dict[str, Any]] = []
+        for composition_id, matches in by_composition.items():
+            best = matches[0]
+            composition_metadata = (
+                self._compositions.loc[composition_id].to_dict()
+                if not self._compositions.empty
+                else {}
+            )
+            composition_results.append(
+                {
+                    "composition_id": composition_id,
+                    "canonical_title": composition_metadata.get("canonical_title"),
+                    "score": best["score"],
+                    "score_type": "cosine_similarity",
+                    "best_matching_audio_id": best["audio_id"],
+                    "composition_metadata": composition_metadata,
+                    "recording_evidence": matches,
+                }
+            )
+        composition_results.sort(key=lambda item: (-item["score"], item["composition_id"]))
+        return composition_results[:top_k]
+
+
+def _print_results(results: list[dict[str, Any]]) -> None:
+    if not results:
+        print("No indexed recordings are available for comparison.")
+        return
+    for position, result in enumerate(results, start=1):
+        evidence = result["recording_evidence"][0]
+        print(
+            f"{position}. {result['canonical_title'] or result['composition_id']} "
+            f"({result['composition_id']}) | cosine similarity {result['score']:.4f} "
+            f"| audio {evidence['audio_id']}"
+        )
+
+
+def main() -> None:
+    """Run the audio engine against the packaged recordings."""
+    parser = argparse.ArgumentParser(description="Retrieve Annamayya compositions by audio similarity.")
+    parser.add_argument("query_audio", nargs="?", help="Query recording path")
+    parser.add_argument("--top-k", type=int, default=10)
+    arguments = parser.parse_args()
+
+    compositions, _, audio_records = load_normalized_data()
+    engine = AudioRetrievalEngine(audio_records, compositions=compositions)
+    stats = engine.build_index()
+    print("Index statistics:", stats)
+    if not arguments.query_audio:
+        parser.error("provide a query audio path, for example Recordings/audio001.mp3")
+    results = engine.search_audio(arguments.query_audio, top_k=arguments.top_k)
+    _print_results(results)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"Audio retrieval could not run: {exc}") from exc
+
+========================================================================================
+FILE: data_loader.py
+========================================================================================
+"""Normalize the Annamayya dataset into composition, text, and audio tables.
+
+The packaged source is an Excel workbook rather than ``metadata.csv``.  This
+module therefore defaults to ``annamayya_dataset_package/Annamayya_25_Song_Dataset.xlsx``
+and also accepts CSV files when a future dataset uses that format.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import re
+from typing import Any
+import warnings
+
+import pandas as pd
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_ROOT / "annamayya_dataset_package"
+DEFAULT_SOURCE_PATH = DATASET_DIR / "Annamayya_25_Song_Dataset.xlsx"
+
+COMPOSITION_COLUMNS = [
+    "composition_id",
+    "canonical_title",
+    "singer",
+    "raga",
+    "tala",
+    "text_source_url",
+    "transliteration_source_url",
+    "translation_source_url",
+    "audio_source_url",
+    "notes",
+]
+TEXT_COLUMNS = [
+    "text_id",
+    "composition_id",
+    "text_type",
+    "language",
+    "content",
+    "source_url",
+    "source_column",
+    "notes",
+]
+AUDIO_COLUMNS = [
+    "audio_id",
+    "composition_id",
+    "audio_path",
+    "audio_file_exists",
+    "recording_title",
+    "singer",
+    "raga",
+    "tala",
+    "source_url",
+]
+
+_REQUIRED_SOURCE_COLUMNS = {"Composition ID", "Song title"}
+_TEXT_MAPPINGS = (
+    ("Telugu lyrics", "lyrics", "Telugu", "Text source URL"),
+    (
+        "English transliteration",
+        "transliteration",
+        "Romanized Telugu",
+        "English transliteration source URL",
+    ),
+    (
+        "English meaning/translation",
+        "translation",
+        "English",
+        "Telugu meaning source URL",
+    ),
+)
+_PROVISIONAL_WORD = re.compile(r"\bprovisional\b", re.IGNORECASE)
+
+
+def _clean_value(value: Any) -> str | None:
+    """Return a stripped non-empty string, or ``None`` for any missing value."""
+    if value is None or pd.isna(value):
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _optional_value(row: pd.Series, column: str) -> str | None:
+    return _clean_value(row[column]) if column in row.index else None
+
+
+def _require_columns(source: pd.DataFrame, columns: set[str]) -> None:
+    missing = sorted(columns - set(source.columns))
+    if missing:
+        raise ValueError("Source dataset is missing required column(s): " + ", ".join(missing))
+
+
+def load_source(source_path: str | Path | None = None) -> pd.DataFrame:
+    """Load the packaged workbook (or a supplied CSV/XLSX source) into a DataFrame."""
+    path = Path(source_path) if source_path is not None else DEFAULT_SOURCE_PATH
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset source was not found: {path}")
+
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            source = pd.read_csv(path)
+        elif suffix in {".xlsx", ".xls"}:
+            source = pd.read_excel(path)
+        else:
+            raise ValueError("Unsupported source format. Use a .csv, .xlsx, or .xls file.")
+    except Exception as exc:
+        raise ValueError(f"Could not read dataset source '{path}': {exc}") from exc
+
+    if source.empty:
+        raise ValueError(f"Dataset source is empty: {path}")
+    _require_columns(source, _REQUIRED_SOURCE_COLUMNS)
+    return source
+
+
+def extract_compositions(source: pd.DataFrame) -> pd.DataFrame:
+    """Return one normalized row per unique source composition."""
+    _require_columns(source, _REQUIRED_SOURCE_COLUMNS)
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for index, row in source.iterrows():
+        composition_id = _clean_value(row["Composition ID"])
+        if composition_id is None:
+            raise ValueError(f"Row {index} has no usable Composition ID; parent links are unsafe.")
+        if composition_id in seen_ids:
+            continue
+        seen_ids.add(composition_id)
+        rows.append(
+            {
+                "composition_id": composition_id,
+                "canonical_title": _optional_value(row, "Song title"),
+                "singer": _optional_value(row, "Singer"),
+                "raga": _optional_value(row, "Raga"),
+                "tala": _optional_value(row, "Tala"),
+                "text_source_url": _optional_value(row, "Text source URL"),
+                "transliteration_source_url": _optional_value(
+                    row, "English transliteration source URL"
+                ),
+                "translation_source_url": _optional_value(row, "Telugu meaning source URL"),
+                "audio_source_url": _optional_value(row, "Audio source URL"),
+                "notes": _optional_value(row, "Notes"),
+            }
+        )
+    return pd.DataFrame(rows, columns=COMPOSITION_COLUMNS)
+
+
+def extract_text_records(source: pd.DataFrame) -> pd.DataFrame:
+    """Unpivot available lyric, transliteration, and translation columns into rows."""
+    _require_columns(source, _REQUIRED_SOURCE_COLUMNS)
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str | None]] = set()
+
+    for index, row in source.iterrows():
+        composition_id = _clean_value(row["Composition ID"])
+        if composition_id is None:
+            raise ValueError(f"Row {index} has no usable Composition ID; text parent is unsafe.")
+        for source_column, text_type, language, url_column in _TEXT_MAPPINGS:
+            if source_column not in source.columns:
+                continue
+            content = _optional_value(row, source_column)
+            if content is None:
+                continue
+            if text_type == "translation" and _PROVISIONAL_WORD.search(content):
+                continue
+            source_url = _optional_value(row, url_column)
+            dedupe_key = (composition_id, text_type, content, source_url)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            records.append(
+                {
+                    "composition_id": composition_id,
+                    "text_type": text_type,
+                    "language": language,
+                    "content": content,
+                    "source_url": source_url,
+                    "source_column": source_column,
+                    "notes": _optional_value(row, "Notes"),
+                }
+            )
+
+    for number, record in enumerate(records, start=1):
+        record["text_id"] = f"T{number:03d}"
+    return pd.DataFrame(records, columns=TEXT_COLUMNS)
+
+
+def extract_audio_records(source: pd.DataFrame, source_path: str | Path | None = None) -> pd.DataFrame:
+    """Return normalized recording rows for nonblank ``Audio file name`` values.
+
+    Audio filenames are made package-relative (``Recordings/<filename>``).  The
+    ``audio_file_exists`` flag reports local package availability without
+    dropping a valid source reference whose file is absent.
+    """
+    _require_columns(source, _REQUIRED_SOURCE_COLUMNS)
+    if "Audio file name" not in source.columns:
+        return pd.DataFrame(columns=AUDIO_COLUMNS)
+
+    dataset_dir = (Path(source_path).parent if source_path is not None else DATASET_DIR)
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, row in source.iterrows():
+        composition_id = _clean_value(row["Composition ID"])
+        if composition_id is None:
+            raise ValueError(f"Row {index} has no usable Composition ID; audio parent is unsafe.")
+        filename = _optional_value(row, "Audio file name")
+        if filename is None:
+            continue
+        audio_path = Path("Recordings") / filename
+        dedupe_key = (composition_id, audio_path.as_posix())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        records.append(
+            {
+                "composition_id": composition_id,
+                "audio_path": audio_path.as_posix(),
+                "audio_file_exists": (dataset_dir / audio_path).is_file(),
+                "recording_title": _optional_value(row, "Song title"),
+                "singer": _optional_value(row, "Singer"),
+                "raga": _optional_value(row, "Raga"),
+                "tala": _optional_value(row, "Tala"),
+                "source_url": _optional_value(row, "Audio source URL"),
+            }
+        )
+    for number, record in enumerate(records, start=1):
+        record["audio_id"] = f"R{number:03d}"
+    return pd.DataFrame(records, columns=AUDIO_COLUMNS)
+
+
+def validate_normalized_data(
+    compositions: pd.DataFrame, text_records: pd.DataFrame, audio_records: pd.DataFrame
+) -> list[str]:
+    """Return data-quality warnings; raise ``ValueError`` for integrity failures."""
+    if not compositions["composition_id"].is_unique:
+        raise ValueError("Composition IDs are not unique.")
+    if not text_records["text_id"].is_unique:
+        raise ValueError("Text IDs are not unique.")
+    if not audio_records["audio_id"].is_unique:
+        raise ValueError("Audio IDs are not unique.")
+
+    parent_ids = set(compositions["composition_id"])
+    for name, frame in (("TextRecords", text_records), ("AudioRecords", audio_records)):
+        unknown = set(frame["composition_id"]) - parent_ids
+        if unknown:
+            raise ValueError(f"{name} contains unknown composition IDs: {sorted(unknown)}")
+
+    if text_records["content"].map(_clean_value).isna().any():
+        raise ValueError("TextRecords contains empty content.")
+    translations = text_records.loc[text_records["text_type"] == "translation", "content"]
+    if translations.str.contains(_PROVISIONAL_WORD, na=False).any():
+        raise ValueError("A prohibited provisional translation remains.")
+    if audio_records["audio_path"].map(_clean_value).isna().any():
+        raise ValueError("AudioRecords contains a blank audio path.")
+
+    warnings_found: list[str] = []
+    if "audio_file_exists" in audio_records and (~audio_records["audio_file_exists"]).any():
+        missing = audio_records.loc[~audio_records["audio_file_exists"], "audio_path"].tolist()
+        warnings_found.append("Audio source references not present in the package: " + ", ".join(missing))
+    return warnings_found
+
+
+def load_normalized_data(
+    source_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load the source and return ``(Compositions, TextRecords, AudioRecords)``."""
+    source = load_source(source_path)
+    compositions = extract_compositions(source)
+    text_records = extract_text_records(source)
+    audio_records = extract_audio_records(source, source_path)
+    for message in validate_normalized_data(compositions, text_records, audio_records):
+        warnings.warn(message, UserWarning, stacklevel=2)
+    return compositions, text_records, audio_records
+
+
+def _main() -> None:
+    """Run an inspectable direct-execution verification against the default source."""
+    source = load_source()
+    compositions = extract_compositions(source)
+    text_records = extract_text_records(source)
+    audio_records = extract_audio_records(source)
+    quality_warnings = validate_normalized_data(compositions, text_records, audio_records)
+
+    print(f"Source: {DEFAULT_SOURCE_PATH}")
+    print("Source columns:", list(source.columns))
+    for name, frame in (
+        ("Compositions", compositions),
+        ("TextRecords", text_records),
+        ("AudioRecords", audio_records),
+    ):
+        print(f"\n{name}: shape={frame.shape}")
+        print("Columns:", list(frame.columns))
+        print(frame.head().to_string(index=False))
+
+    provisional_removed = int(
+        source.get("English meaning/translation", pd.Series(dtype="object"))
+        .map(_clean_value)
+        .map(lambda text: bool(text and _PROVISIONAL_WORD.search(text)))
+        .sum()
+    )
+    blank_audio_excluded = int(
+        source.get("Audio file name", pd.Series(dtype="object")).map(_clean_value).isna().sum()
+    )
+    print(f"\nTranslations removed for 'Provisional': {provisional_removed}")
+    print(f"Audio rows excluded for blank paths: {blank_audio_excluded}")
+    print("Integrity checks: PASS (unique IDs, valid parent references, valid text and audio rows)")
+    for message in quality_warnings:
+        print("Data-quality warning:", message)
+
+
+if __name__ == "__main__":
+    _main()
+
+========================================================================================
+FILE: gather.py
+========================================================================================
+"""Combine selected Python source files into a single review-friendly text file.
+
+Run ``python gather.py`` and choose specific files, all Python files, or files
+modified recently. Output is written to ``gathered_code.txt`` in this directory.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT = PROJECT_ROOT / "gathered_code.txt"
+
+
+def python_files(root: Path = PROJECT_ROOT) -> list[Path]:
+    """List project Python files, excluding common generated/dependency folders."""
+    excluded = {".git", ".venv", "venv", "__pycache__", "site-packages", "node_modules"}
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if not any(part in excluded for part in path.relative_to(root).parts)
+    )
+
+
+def recently_modified(files: list[Path], since_timestamp: float) -> list[Path]:
+    """Select files modified since the current gather session began."""
+    return [path for path in files if path.stat().st_mtime >= since_timestamp]
+
+
+def write_bundle(files: list[Path], output_path: Path = DEFAULT_OUTPUT) -> Path:
+    """Write source contents with clear file separators; return output path."""
+    resolved_output = output_path.resolve()
+    selected = [path for path in files if path.resolve() != resolved_output]
+    if not selected:
+        raise ValueError("No Python files were selected to gather.")
+
+    sections = [
+        "Python source bundle",
+        f"Created: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"Files included: {len(selected)}",
+        "",
+    ]
+    for path in selected:
+        try:
+            relative = path.resolve().relative_to(PROJECT_ROOT)
+        except ValueError:
+            relative = path
+        content = path.read_text(encoding="utf-8")
+        sections.extend(
+            [
+                "=" * 88,
+                f"FILE: {relative}",
+                "=" * 88,
+                content.rstrip(),
+                "",
+            ]
+        )
+    resolved_output.write_text("\n".join(sections), encoding="utf-8")
+    return resolved_output
+
+
+def _choose_files(files: list[Path]) -> list[Path]:
+    if not files:
+        return []
+    print("Python files in project:")
+    for number, path in enumerate(files, start=1):
+        print(f"  {number}. {path.relative_to(PROJECT_ROOT)}")
+    answer = input("Enter file numbers separated by commas (or 'all'): ").strip().lower()
+    if answer == "all":
+        return files
+
+    selected: list[Path] = []
+    for value in answer.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            index = int(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid file number: {value!r}") from exc
+        if index < 1 or index > len(files):
+            raise ValueError(f"File number out of range: {index}")
+        path = files[index - 1]
+        if path not in selected:
+            selected.append(path)
+    return selected
+
+
+def main() -> None:
+    """Prompt for the bundle mode, then write the selected source files."""
+    session_started = datetime.now().timestamp()
+    files = python_files()
+    if not files:
+        print(f"No Python files found under {PROJECT_ROOT}.")
+        return
+
+    print("Gather Python files into one text file")
+    print("  1. Select specific files")
+    print("  2. Gather all Python files")
+    print("  3. Gather files modified since this gather session started")
+    choice = input("Choose 1, 2, or 3: ").strip()
+
+    if choice == "1":
+        selected = _choose_files(files)
+    elif choice == "2":
+        selected = files
+    elif choice == "3":
+        selected = recently_modified(files, session_started)
+    else:
+        raise ValueError("Choose 1, 2, or 3.")
+
+    if not selected:
+        print("No Python files matched that selection. No output file was written.")
+        return
+
+    output = write_bundle(selected)
+    print(f"Gathered {len(selected)} file(s) into {output}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Could not gather Python files: {exc}") from exc
+
+========================================================================================
+FILE: knowledge_graph.py
+========================================================================================
+"""Optional, idempotent Neo4j representation of normalized Annamayya data."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import pandas as pd
+
+
+SCHEMA_QUERIES = (
+    "CREATE CONSTRAINT composition_id IF NOT EXISTS FOR (n:Composition) REQUIRE n.composition_id IS UNIQUE",
+    "CREATE CONSTRAINT text_id IF NOT EXISTS FOR (n:TextRecord) REQUIRE n.text_id IS UNIQUE",
+    "CREATE CONSTRAINT audio_id IF NOT EXISTS FOR (n:AudioRecording) REQUIRE n.audio_id IS UNIQUE",
+    "CREATE CONSTRAINT singer_name IF NOT EXISTS FOR (n:Singer) REQUIRE n.name IS UNIQUE",
+    "CREATE CONSTRAINT raga_name IF NOT EXISTS FOR (n:Raga) REQUIRE n.name IS UNIQUE",
+    "CREATE CONSTRAINT tala_name IF NOT EXISTS FOR (n:Tala) REQUIRE n.name IS UNIQUE",
+)
+
+
+def _value(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _props(row: pd.Series, excluded: set[str]) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in excluded or value is None or pd.isna(value):
+            continue
+        if isinstance(value, str):
+            properties[str(key)] = value.strip()
+        elif hasattr(value, "item"):
+            # Convert NumPy scalar wrappers (e.g. numpy.bool_) to values the
+            # Neo4j driver can serialize as native Python types.
+            properties[str(key)] = value.item()
+        else:
+            properties[str(key)] = value
+    return properties
+
+
+class AnnamayyaKnowledgeGraph:
+    """Manage stable composition, text, audio, and metadata nodes in Neo4j.
+
+    Relationships point from child record to composition for ``BELONGS_TO``
+    and ``RECORDING_OF``. Metadata relationships point from composition to
+    ``Singer``, ``Raga``, and ``Tala`` nodes.
+    """
+
+    def __init__(
+        self,
+        uri: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        *,
+        driver: Any | None = None,
+    ) -> None:
+        self.uri = uri or os.getenv("NEO4J_URI")
+        self.username = username or os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER")
+        self.password = password or os.getenv("NEO4J_PASSWORD")
+        self.driver = driver
+
+    def connect(self) -> None:
+        """Create and verify a driver using environment settings or injected driver."""
+        if self.driver is not None:
+            try:
+                self.driver.verify_connectivity()
+                return
+            except Exception as exc:
+                raise RuntimeError(f"Could not connect to Neo4j: {exc}") from exc
+        if not self.uri or not self.username or not self.password:
+            raise RuntimeError(
+                "Neo4j is not configured. Set NEO4J_URI, NEO4J_USERNAME, and NEO4J_PASSWORD."
+            )
+        try:
+            from neo4j import GraphDatabase
+        except ImportError as exc:
+            raise RuntimeError("Neo4j Python driver is missing. Install it with: python -m pip install neo4j") from exc
+        try:
+            self.driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+            self.driver.verify_connectivity()
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(f"Could not connect to Neo4j at {self.uri}: {exc}") from exc
+
+    def _require_driver(self) -> Any:
+        if self.driver is None:
+            raise RuntimeError("Not connected to Neo4j. Call connect() first.")
+        return self.driver
+
+    def initialize_schema(self) -> None:
+        """Create idempotent uniqueness constraints for graph entity keys."""
+        driver = self._require_driver()
+        with driver.session() as session:
+            for query in SCHEMA_QUERIES:
+                session.run(query)
+
+    def import_dataset(
+        self,
+        compositions: pd.DataFrame,
+        text_records: pd.DataFrame,
+        audio_records: pd.DataFrame,
+    ) -> dict[str, int]:
+        """Upsert normalized rows and only the parent/metadata links they support."""
+        required = {
+            "compositions": (compositions, {"composition_id"}),
+            "text_records": (text_records, {"text_id", "composition_id"}),
+            "audio_records": (audio_records, {"audio_id", "composition_id"}),
+        }
+        for name, (frame, columns) in required.items():
+            missing = sorted(columns - set(frame.columns))
+            if missing:
+                raise ValueError(f"{name} is missing required columns: {', '.join(missing)}")
+        composition_ids = {_value(value) for value in compositions["composition_id"]}
+        composition_ids.discard(None)
+        for name, frame in (("text_records", text_records), ("audio_records", audio_records)):
+            orphaned = {
+                _value(value) for value in frame["composition_id"]
+                if _value(value) is not None and _value(value) not in composition_ids
+            }
+            if orphaned:
+                raise ValueError(
+                    f"{name} refers to unknown composition IDs: {', '.join(sorted(orphaned))}"
+                )
+        driver = self._require_driver()
+        counts = {"compositions": 0, "text_records": 0, "audio_records": 0, "metadata_links": 0}
+        self.initialize_schema()
+        with driver.session() as session:
+            for _, row in compositions.iterrows():
+                composition_id = _value(row["composition_id"])
+                if composition_id is None:
+                    continue
+                props = _props(row, {"composition_id"})
+                session.run(
+                    "MERGE (c:Composition {composition_id: $composition_id}) SET c += $properties",
+                    composition_id=composition_id,
+                    properties=props,
+                )
+                counts["compositions"] += 1
+                for field, label, relationship in (
+                    ("singer", "Singer", "PERFORMED_BY"),
+                    ("raga", "Raga", "USES_RAGA"),
+                    ("tala", "Tala", "USES_TALA"),
+                ):
+                    name = _value(row.get(field))
+                    if name is None:
+                        continue
+                    query = (
+                        f"MERGE (entity:{label} {{name: $name}}) "
+                        "WITH entity MATCH (c:Composition {composition_id: $composition_id}) "
+                        f"MERGE (c)-[:{relationship}]->(entity)"
+                    )
+                    session.run(query, name=name, composition_id=composition_id)
+                    counts["metadata_links"] += 1
+
+            for _, row in text_records.iterrows():
+                text_id = _value(row["text_id"])
+                composition_id = _value(row["composition_id"])
+                if text_id is None or composition_id is None:
+                    continue
+                session.run(
+                    "MERGE (t:TextRecord {text_id: $text_id}) SET t += $properties "
+                    "WITH t MATCH (c:Composition {composition_id: $composition_id}) "
+                    "MERGE (t)-[:BELONGS_TO]->(c)",
+                    text_id=text_id,
+                    composition_id=composition_id,
+                    properties=_props(row, {"text_id", "composition_id"}),
+                )
+                counts["text_records"] += 1
+
+            for _, row in audio_records.iterrows():
+                audio_id = _value(row["audio_id"])
+                composition_id = _value(row["composition_id"])
+                if audio_id is None or composition_id is None:
+                    continue
+                session.run(
+                    "MERGE (a:AudioRecording {audio_id: $audio_id}) SET a += $properties "
+                    "WITH a MATCH (c:Composition {composition_id: $composition_id}) "
+                    "MERGE (a)-[:RECORDING_OF]->(c)",
+                    audio_id=audio_id,
+                    composition_id=composition_id,
+                    properties=_props(row, {"audio_id", "composition_id"}),
+                )
+                counts["audio_records"] += 1
+        return counts
+
+    @staticmethod
+    def _records(result: Any) -> list[dict[str, Any]]:
+        return [record.data() for record in result]
+
+    def get_composition_details(self, composition_id: str) -> dict[str, Any] | None:
+        """Return one composition and its associated text/audio/metadata entities."""
+        if not _value(composition_id):
+            raise ValueError("composition_id must be non-empty.")
+        query = (
+            "MATCH (c:Composition {composition_id: $composition_id}) "
+            "OPTIONAL MATCH (t:TextRecord)-[:BELONGS_TO]->(c) "
+            "OPTIONAL MATCH (a:AudioRecording)-[:RECORDING_OF]->(c) "
+            "OPTIONAL MATCH (c)-[:PERFORMED_BY]->(s:Singer) "
+            "OPTIONAL MATCH (c)-[:USES_RAGA]->(r:Raga) "
+            "OPTIONAL MATCH (c)-[:USES_TALA]->(tl:Tala) "
+            "RETURN properties(c) AS composition, "
+            "collect(DISTINCT properties(t)) AS text_records, "
+            "collect(DISTINCT properties(a)) AS audio_records, "
+            "collect(DISTINCT s.name) AS singers, collect(DISTINCT r.name) AS ragas, "
+            "collect(DISTINCT tl.name) AS talas"
+        )
+        with self._require_driver().session() as session:
+            record = session.run(query, composition_id=str(composition_id)).single()
+        return record.data() if record else None
+
+    def get_recordings(self, composition_id: str) -> list[dict[str, Any]]:
+        """Return known recording nodes for a composition, or an empty list."""
+        query = (
+            "MATCH (a:AudioRecording)-[:RECORDING_OF]->(c:Composition {composition_id: $composition_id}) "
+            "RETURN properties(a) AS recording ORDER BY a.audio_id"
+        )
+        with self._require_driver().session() as session:
+            return self._records(session.run(query, composition_id=str(composition_id)))
+
+    def find_compositions(self, field: str, value: str) -> list[dict[str, Any]]:
+        """Find compositions by verified singer, raga, or tala metadata."""
+        if field not in {"singer", "raga", "tala"}:
+            raise ValueError("field must be one of: singer, raga, tala")
+        cleaned = _value(value)
+        if cleaned is None:
+            raise ValueError("value must be non-empty.")
+        label, relationship = {
+            "singer": ("Singer", "PERFORMED_BY"),
+            "raga": ("Raga", "USES_RAGA"),
+            "tala": ("Tala", "USES_TALA"),
+        }[field]
+        query = (
+            f"MATCH (c:Composition)-[:{relationship}]->(m:{label} {{name: $value}}) "
+            "RETURN properties(c) AS composition ORDER BY c.composition_id"
+        )
+        with self._require_driver().session() as session:
+            return self._records(session.run(query, value=cleaned))
+
+    def close(self) -> None:
+        """Close and release the underlying Neo4j driver, if any."""
+        if self.driver is not None:
+            self.driver.close()
+            self.driver = None
+
+    def __enter__(self) -> "AnnamayyaKnowledgeGraph":
+        self.connect()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+========================================================================================
+FILE: multimodal_retrieval.py
+========================================================================================
+"""Rank composition candidates from the existing text and audio engines.
+
+Fusion uses weighted reciprocal rank fusion (RRF), which avoids treating text
+and audio cosine scores as if their numerical ranges were calibrated alike.
+The source branch scores and evidence remain in each result unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import OrderedDict
+import math
+from pathlib import Path
+from typing import Any, Sequence
+
+import pandas as pd
+
+from data_loader import load_normalized_data
+from text_retrieval import build_engine as build_text_engine
+from audio_retrieval import AudioRetrievalEngine
+
+
+class RetrievalBranchError(RuntimeError):
+    """Raised when every requested modality fails during retrieval."""
+
+    def __init__(self, errors: dict[str, str]):
+        self.errors = errors
+        details = "; ".join(f"{branch}: {message}" for branch, message in errors.items())
+        super().__init__(f"All requested retrieval branches failed ({details}).")
+
+
+class MultimodalRetrievalEngine:
+    """Fuse ranked composition candidates from text and/or audio retrieval."""
+
+    def __init__(
+        self,
+        text_engine: Any | None = None,
+        audio_engine: Any | None = None,
+        compositions: pd.DataFrame | None = None,
+        *,
+        text_weight: float = 0.6,
+        audio_weight: float = 0.4,
+        rrf_constant: int = 60,
+        candidate_k: int = 100,
+        knowledge_graph: Any | None = None,
+    ) -> None:
+        if (
+            not math.isfinite(text_weight)
+            or not math.isfinite(audio_weight)
+            or text_weight < 0
+            or audio_weight < 0
+            or text_weight + audio_weight <= 0
+        ):
+            raise ValueError("Modality weights must be non-negative and have a positive sum.")
+        if isinstance(rrf_constant, bool) or not isinstance(rrf_constant, int) or rrf_constant < 0:
+            raise ValueError("rrf_constant must be a non-negative integer.")
+        if isinstance(candidate_k, bool) or not isinstance(candidate_k, int) or candidate_k <= 0:
+            raise ValueError("candidate_k must be a positive integer.")
+        self.text_engine = text_engine
+        self.audio_engine = audio_engine
+        self.compositions = compositions
+        self.text_weight = float(text_weight)
+        self.audio_weight = float(audio_weight)
+        self.rrf_constant = rrf_constant
+        self.candidate_k = candidate_k
+        self.knowledge_graph = knowledge_graph
+        self.last_branch_errors: dict[str, str] = {}
+        self.last_graph_error: str | None = None
+
+    @staticmethod
+    def _normalise_results(results: Sequence[dict[str, Any]]) -> OrderedDict[str, dict[str, Any]]:
+        """Deduplicate composition results by retaining the first ranked item."""
+        unique: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for result in results or []:
+            composition_id = result.get("composition_id")
+            if composition_id is None or pd.isna(composition_id):
+                continue
+            key = str(composition_id)
+            unique.setdefault(key, result)
+        return unique
+
+    def search(
+        self,
+        text_query: str | None = None,
+        audio_query_path: str | Path | None = None,
+        top_k: int = 10,
+        *,
+        languages: str | Sequence[str] | None = None,
+        text_types: str | Sequence[str] | None = None,
+        raise_on_branch_error: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Search one or both modalities and return fused composition candidates.
+
+        RRF contribution is ``(rrf_constant + 1) / (rrf_constant + rank)``.
+        Successful supplied modalities' configured weights are renormalized to
+        sum to one. A branch failure is recorded; an optional successful branch
+        can still return candidates. If every requested branch fails, the method
+        raises :class:`RetrievalBranchError` unless ``raise_on_branch_error`` is
+        false, in which case it returns an empty list and exposes errors on
+        ``last_branch_errors``.
+        """
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        has_text = text_query is not None
+        has_audio = audio_query_path is not None
+        if not has_text and not has_audio:
+            raise ValueError("Provide text_query, audio_query_path, or both.")
+        if has_text and (not isinstance(text_query, str) or not text_query.strip()):
+            raise ValueError("text_query must contain non-whitespace text when supplied.")
+        if has_audio and (not isinstance(audio_query_path, (str, Path)) or not str(audio_query_path).strip()):
+            raise ValueError("audio_query_path must contain a non-empty path when supplied.")
+
+        self.last_branch_errors = {}
+        self.last_graph_error = None
+        branch_results: dict[str, OrderedDict[str, dict[str, Any]]] = {}
+        if has_text:
+            if self.text_engine is None:
+                self.last_branch_errors["text"] = "No text retrieval engine was configured."
+            else:
+                try:
+                    kwargs: dict[str, Any] = {"top_k": self.candidate_k}
+                    if languages is not None:
+                        kwargs["languages"] = languages
+                    if text_types is not None:
+                        kwargs["text_types"] = text_types
+                    raw = self.text_engine.search_text(text_query, **kwargs)
+                    branch_results["text"] = self._normalise_results(raw)
+                except Exception as exc:
+                    self.last_branch_errors["text"] = str(exc)
+        if has_audio:
+            if self.audio_engine is None:
+                self.last_branch_errors["audio"] = "No audio retrieval engine was configured."
+            else:
+                try:
+                    raw = self.audio_engine.search_audio(audio_query_path, top_k=self.candidate_k)
+                    branch_results["audio"] = self._normalise_results(raw)
+                except Exception as exc:
+                    self.last_branch_errors["audio"] = str(exc)
+
+        if not branch_results:
+            if raise_on_branch_error:
+                raise RetrievalBranchError(self.last_branch_errors)
+            return []
+
+        active_weights = {
+            "text": self.text_weight if "text" in branch_results else 0.0,
+            "audio": self.audio_weight if "audio" in branch_results else 0.0,
+        }
+        total_weight = sum(active_weights.values())
+        if total_weight <= 0:
+            raise ValueError("All successfully evaluated modalities have zero weight.")
+        effective_weights = {name: value / total_weight for name, value in active_weights.items()}
+
+        all_ids = set().union(*(set(results) for results in branch_results.values()))
+        fused: list[dict[str, Any]] = []
+        for composition_id in all_ids:
+            text_result = branch_results.get("text", {}).get(composition_id)
+            audio_result = branch_results.get("audio", {}).get(composition_id)
+            text_rank = (
+                list(branch_results["text"]).index(composition_id) + 1
+                if text_result is not None
+                else None
+            )
+            audio_rank = (
+                list(branch_results["audio"]).index(composition_id) + 1
+                if audio_result is not None
+                else None
+            )
+            contributions: dict[str, float] = {}
+            if text_rank is not None:
+                contributions["text"] = effective_weights["text"] * (
+                    self.rrf_constant + 1
+                ) / (self.rrf_constant + text_rank)
+            if audio_rank is not None:
+                contributions["audio"] = effective_weights["audio"] * (
+                    self.rrf_constant + 1
+                ) / (self.rrf_constant + audio_rank)
+
+            metadata = {}
+            if text_result:
+                metadata.update(text_result.get("metadata") or {})
+            if audio_result:
+                metadata.update(audio_result.get("composition_metadata") or {})
+            canonical_title = (
+                (text_result or {}).get("canonical_title")
+                or (audio_result or {}).get("canonical_title")
+                or metadata.get("canonical_title")
+            )
+            modalities = [name for name, result in (("text", text_result), ("audio", audio_result)) if result]
+            fused.append(
+                {
+                    "composition_id": composition_id,
+                    "canonical_title": canonical_title,
+                    "fused_score": float(sum(contributions.values())),
+                    "text_score": text_result.get("score") if text_result else None,
+                    "audio_score": audio_result.get("score") if audio_result else None,
+                    "text_rank": text_rank,
+                    "audio_rank": audio_rank,
+                    "best_matching_audio_id": (
+                        audio_result.get("best_matching_audio_id") if audio_result else None
+                    ),
+                    "modalities": modalities,
+                    "modality_contributions": contributions,
+                    "metadata": metadata,
+                    "text_evidence": (
+                        {
+                            "best_match": text_result.get("best_match"),
+                            "matching_text_records": text_result.get("matching_text_records", []),
+                            "branch_result": text_result,
+                        }
+                        if text_result
+                        else None
+                    ),
+                    "audio_evidence": (
+                        {
+                            "best_matching_audio_id": audio_result.get("best_matching_audio_id"),
+                            "recording_evidence": audio_result.get("recording_evidence", []),
+                            "branch_result": audio_result,
+                        }
+                        if audio_result
+                        else None
+                    ),
+                }
+            )
+
+        fused.sort(key=lambda item: (-item["fused_score"], item["composition_id"]))
+        results = fused[:top_k]
+        self._enrich_with_graph(results)
+        return results
+
+    def _enrich_with_graph(self, results: list[dict[str, Any]]) -> None:
+        """Attach graph details without changing fused scores or blocking retrieval."""
+        if self.knowledge_graph is None:
+            return
+        for result in results:
+            try:
+                result["graph_data"] = self.knowledge_graph.get_composition_details(
+                    result["composition_id"]
+                )
+            except Exception as exc:
+                self.last_graph_error = str(exc)
+                result["graph_data"] = None
+
+
+def _make_demo(args: argparse.Namespace) -> tuple[MultimodalRetrievalEngine, Any | None]:
+    compositions, text_records, audio_records = load_normalized_data()
+    text_engine = build_text_engine(text_records, compositions) if args.text else None
+    audio_engine = AudioRetrievalEngine(audio_records, compositions) if args.audio else None
+    if audio_engine is not None:
+        print("Audio index:", audio_engine.build_index())
+
+    graph = None
+    graph_requested = args.graph or args.import_graph
+    if graph_requested:
+        try:
+            from knowledge_graph import AnnamayyaKnowledgeGraph
+
+            graph = AnnamayyaKnowledgeGraph()
+            graph.connect()
+            graph.initialize_schema()
+            if args.import_graph:
+                print("Graph import:", graph.import_dataset(compositions, text_records, audio_records))
+        except Exception as exc:
+            if graph is not None:
+                graph.close()
+            graph = None
+            print(f"Neo4j unavailable; continuing without graph enrichment: {exc}")
+
+    engine = MultimodalRetrievalEngine(
+        text_engine=text_engine,
+        audio_engine=audio_engine,
+        compositions=compositions,
+        text_weight=args.text_weight,
+        audio_weight=args.audio_weight,
+        knowledge_graph=graph,
+    )
+    return engine, graph
+
+
+def main() -> None:
+    """Run text-only, audio-only, or combined retrieval from the command line."""
+    parser = argparse.ArgumentParser(description="Fuse Annamayya text and audio retrieval.")
+    parser.add_argument("--text", help="Text query")
+    parser.add_argument("--audio", help="Query audio path")
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--text-weight", type=float, default=0.6)
+    parser.add_argument("--audio-weight", type=float, default=0.4)
+    parser.add_argument("--graph", action="store_true", help="Enrich results from configured Neo4j")
+    parser.add_argument("--import-graph", action="store_true", help="Import the normalized dataset before searching")
+    args = parser.parse_args()
+    if not args.text and not args.audio:
+        parser.error("provide --text, --audio, or both")
+
+    engine, graph = _make_demo(args)
+    try:
+        results = engine.search(args.text, args.audio, args.top_k)
+        for rank, result in enumerate(results, start=1):
+            print(
+                f"{rank}. {result['canonical_title'] or result['composition_id']} "
+                f"({result['composition_id']}) fused={result['fused_score']:.4f} "
+                f"text={result['text_score']} audio={result['audio_score']} "
+                f"via={','.join(result['modalities'])}"
+            )
+            if result["text_evidence"]:
+                evidence = result["text_evidence"]["best_match"]
+                if evidence:
+                    print(f"   text: {evidence['text_id']} {evidence['language']} {evidence['text_type']}")
+            if result["audio_evidence"]:
+                print(f"   audio: {result['best_matching_audio_id']}")
+        if engine.last_branch_errors:
+            print("Retrieval branch errors:", engine.last_branch_errors)
+        if graph is not None:
+            if engine.last_graph_error:
+                print("Graph enrichment error:", engine.last_graph_error)
+            graph.close()
+    except Exception:
+        if graph is not None:
+            graph.close()
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"Multimodal retrieval could not run: {exc}") from exc
+
+========================================================================================
+FILE: test_audio_retrieval.py
+========================================================================================
+"""Synthetic-WAV tests for the audio retrieval baseline."""
+
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import soundfile as sf
+
+from audio_retrieval import AudioRetrievalEngine, extract_audio_features
+
+
+def write_tone(path: Path, frequency: float, duration: float = 1.0) -> None:
+    sample_rate = 22_050
+    time = np.arange(int(sample_rate * duration), dtype=np.float32) / sample_rate
+    waveform = 0.5 * np.sin(2 * np.pi * frequency * time)
+    sf.write(path, waveform, sample_rate)
+
+
+def make_data(root: Path):
+    first = root / "tone_a.wav"
+    second = root / "tone_a_long.wav"
+    third = root / "tone_b.wav"
+    write_tone(first, 440.0, 1.0)
+    write_tone(second, 440.0, 1.7)
+    write_tone(third, 880.0, 1.1)
+    records = pd.DataFrame(
+        [
+            {"audio_id": "R1", "composition_id": "A1", "audio_path": str(first), "recording_title": "First"},
+            {"audio_id": "R2", "composition_id": "A1", "audio_path": str(second), "recording_title": "Second take"},
+            {"audio_id": "R3", "composition_id": "A2", "audio_path": str(third), "recording_title": "Other"},
+        ]
+    )
+    compositions = pd.DataFrame(
+        [
+            {"composition_id": "A1", "canonical_title": "A tone"},
+            {"composition_id": "A2", "canonical_title": "B tone"},
+        ]
+    )
+    return records, compositions, first, second
+
+
+class AudioRetrievalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.records, self.compositions, self.query_path, self.second_path = make_data(self.root)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_features_are_fixed_size_finite_and_duration_independent(self):
+        short = extract_audio_features(self.query_path)
+        long = extract_audio_features(self.second_path)
+        self.assertEqual(short.shape, (64,))
+        self.assertEqual(long.shape, (64,))
+        self.assertTrue(np.isfinite(short).all())
+        self.assertTrue(np.isfinite(long).all())
+        self.assertAlmostEqual(float(np.linalg.norm(short)), 1.0, places=5)
+
+    def test_index_stats_retrieval_mapping_and_composition_aggregation(self):
+        engine = AudioRetrievalEngine(self.records, self.compositions)
+        stats = engine.build_index()
+        self.assertEqual((stats["encountered"], stats["indexed"], stats["skipped"], stats["failed"]), (3, 3, 0, 0))
+        results = engine.search_audio(self.query_path, top_k=10)
+        self.assertEqual(results[0]["composition_id"], "A1")
+        self.assertEqual(results[0]["best_matching_audio_id"], "R1")
+        self.assertEqual(results[0]["score_type"], "cosine_similarity")
+        self.assertAlmostEqual(results[0]["score"], 1.0, places=5)
+        self.assertEqual(len({result["composition_id"] for result in results}), len(results))
+        self.assertEqual(len(results[0]["recording_evidence"]), 2)
+
+    def test_missing_empty_and_corrupt_recordings_are_reported(self):
+        empty = self.root / "empty.wav"
+        empty.write_bytes(b"")
+        corrupt = self.root / "broken.mp3"
+        corrupt.write_bytes(b"not an audio stream")
+        records = pd.concat(
+            [
+                self.records,
+                pd.DataFrame(
+                    [
+                        {"audio_id": "R4", "composition_id": "A2", "audio_path": str(self.root / 'missing.wav')},
+                        {"audio_id": "R5", "composition_id": "A2", "audio_path": str(empty)},
+                        {"audio_id": "R6", "composition_id": "A2", "audio_path": str(corrupt)},
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        stats = AudioRetrievalEngine(records, self.compositions).build_index()
+        self.assertEqual(stats["encountered"], 6)
+        self.assertEqual(stats["indexed"], 3)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["failed"], 2)
+        self.assertIn("R4", stats["skipped_audio_ids"])
+        self.assertIn("R5", stats["failures"])
+        self.assertIn("R6", stats["failures"])
+
+    def test_empty_index_bad_query_top_k_and_feature_failure(self):
+        empty_records = self.records.iloc[0:0]
+        engine = AudioRetrievalEngine(empty_records, self.compositions)
+        self.assertEqual(engine.search_audio(self.query_path), [])
+        with self.assertRaises(ValueError):
+            engine.search_audio(self.query_path, top_k=0)
+        with self.assertRaises(ValueError):
+            engine.search_audio("   ")
+        with self.assertRaises(FileNotFoundError):
+            engine.search_audio(self.root / "not_here.wav")
+
+        with patch("audio_retrieval.extract_audio_features", side_effect=ValueError("test extraction error")):
+            failed_engine = AudioRetrievalEngine(self.records, self.compositions)
+            stats = failed_engine.build_index()
+        self.assertEqual(stats["indexed"], 0)
+        self.assertEqual(stats["failed"], 3)
+        self.assertEqual(failed_engine.search_audio(self.query_path), [])
+
+    def test_input_schema_and_unknown_parent_validation(self):
+        with self.assertRaisesRegex(ValueError, "missing required"):
+            AudioRetrievalEngine(pd.DataFrame(), self.compositions)
+        bad_compositions = pd.DataFrame([{"composition_id": "OTHER", "canonical_title": "Other"}])
+        engine = AudioRetrievalEngine(self.records, bad_compositions)
+        stats = engine.build_index()
+        self.assertEqual(stats["failed"], 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+========================================================================================
+FILE: test_knowledge_graph.py
+========================================================================================
+"""Mocked Neo4j tests; no live Neo4j server is required."""
+
+import os
+import unittest
+from unittest.mock import patch
+
+import pandas as pd
+
+from knowledge_graph import AnnamayyaKnowledgeGraph, SCHEMA_QUERIES
+
+
+class FakeRecord:
+    def __init__(self, values=None):
+        self.values = values
+
+    def data(self):
+        return self.values or {}
+
+
+class FakeResult:
+    def __init__(self, records=None, single=None):
+        self._records = records or []
+        self._single = single
+
+    def __iter__(self):
+        return iter(self._records)
+
+    def single(self):
+        return self._single
+
+
+class FakeSession:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def run(self, query, **parameters):
+        self.driver.calls.append((query, parameters))
+        return self.driver.result
+
+
+class FakeDriver:
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+        self.closed = False
+        self.result = FakeResult(
+            records=[FakeRecord({"composition": {"composition_id": "A1"}})],
+            single=FakeRecord({"composition": {"composition_id": "A1"}, "text_records": []}),
+        )
+
+    def verify_connectivity(self):
+        if self.fail:
+            raise OSError("server unreachable")
+
+    def session(self):
+        return FakeSession(self)
+
+    def close(self):
+        self.closed = True
+
+
+def sample_frames():
+    compositions = pd.DataFrame(
+        [{"composition_id": "A1", "canonical_title": "Song", "singer": "Singer One", "raga": None, "tala": float("nan"), "notes": "verified"}]
+    )
+    texts = pd.DataFrame(
+        [{"text_id": "T1", "composition_id": "A1", "text_type": "lyrics", "language": "Telugu", "content": "పాట", "source_url": "https://example.test"}]
+    )
+    audio = pd.DataFrame(
+        [{"audio_id": "R1", "composition_id": "A1", "audio_path": "Recordings/audio001.mp3", "audio_file_exists": True}]
+    )
+    return compositions, texts, audio
+
+
+class KnowledgeGraphTests(unittest.TestCase):
+    def setUp(self):
+        self.driver = FakeDriver()
+        self.graph = AnnamayyaKnowledgeGraph(driver=self.driver)
+        self.compositions, self.texts, self.audio = sample_frames()
+
+    def test_schema_constraints_and_connection(self):
+        self.graph.connect()
+        self.graph.initialize_schema()
+        queries = [query for query, _ in self.driver.calls]
+        self.assertEqual(queries, list(SCHEMA_QUERIES))
+        self.assertTrue(all("IF NOT EXISTS" in query for query in queries))
+
+    def test_dataset_import_is_parameterized_and_idempotent(self):
+        first = self.graph.import_dataset(self.compositions, self.texts, self.audio)
+        first_count = len(self.driver.calls)
+        second = self.graph.import_dataset(self.compositions, self.texts, self.audio)
+        self.assertEqual(first, {"compositions": 1, "text_records": 1, "audio_records": 1, "metadata_links": 1})
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.driver.calls), first_count * 2)
+        upserts = [(query, params) for query, params in self.driver.calls if "MERGE" in query]
+        self.assertTrue(upserts)
+        for query, params in upserts:
+            self.assertIn("MERGE", query)
+            self.assertNotIn("Song", query)
+            if "TextRecord" in query:
+                self.assertEqual(params["properties"]["content"], "పాట")
+            if "AudioRecording" in query:
+                self.assertIs(params["properties"]["audio_file_exists"], True)
+
+    def test_optional_metadata_and_queries_for_known_unknown_ids(self):
+        result = self.graph.get_composition_details("A1")
+        self.assertEqual(result["composition"]["composition_id"], "A1")
+        self.assertEqual(self.graph.get_recordings("A1")[0]["composition"]["composition_id"], "A1")
+        self.assertTrue(self.graph.find_compositions("singer", "Singer One"))
+        query, parameters = self.driver.calls[-1]
+        self.assertIn("$value", query)
+        self.assertEqual(parameters, {"value": "Singer One"})
+
+        self.driver.result = FakeResult(single=None)
+        self.assertIsNone(self.graph.get_composition_details("unknown"))
+        self.driver.result = FakeResult(records=[])
+        self.assertEqual(self.graph.get_recordings("unknown"), [])
+        with self.assertRaises(ValueError):
+            self.graph.find_compositions("arbitrary", "x")
+
+    def test_missing_configuration_failure_and_close(self):
+        with patch.dict(os.environ, {}, clear=True):
+            graph = AnnamayyaKnowledgeGraph()
+            with self.assertRaisesRegex(RuntimeError, "NEO4J_URI"):
+                graph.connect()
+        bad_driver = FakeDriver(fail=True)
+        graph = AnnamayyaKnowledgeGraph(driver=bad_driver)
+        with self.assertRaisesRegex(RuntimeError, "server unreachable"):
+            graph.connect()
+        self.graph.close()
+        self.assertTrue(self.driver.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+========================================================================================
+FILE: test_multimodal_retrieval.py
+========================================================================================
+"""Deterministic tests for weighted reciprocal-rank fusion."""
+
+import unittest
+from pathlib import Path
+
+from multimodal_retrieval import MultimodalRetrievalEngine, RetrievalBranchError
+
+
+class FakeTextEngine:
+    def __init__(self, results=None, error=None):
+        self.results = results or []
+        self.error = error
+        self.calls = []
+
+    def search_text(self, query, **kwargs):
+        self.calls.append((query, kwargs))
+        if self.error:
+            raise self.error
+        return self.results
+
+
+class FakeAudioEngine:
+    def __init__(self, results=None, error=None):
+        self.results = results or []
+        self.error = error
+        self.calls = []
+
+    def search_audio(self, path, **kwargs):
+        self.calls.append((path, kwargs))
+        if self.error:
+            raise self.error
+        return self.results
+
+
+def text_result(composition_id, score="missing"):
+    result = {
+        "composition_id": composition_id,
+        "canonical_title": f"Title {composition_id}",
+        "score_type": "cosine_similarity",
+        "best_match": {"text_id": f"T-{composition_id}", "content": "text proof"},
+        "matching_text_records": [],
+    }
+    if score != "missing":
+        result["score"] = score
+    return result
+
+
+def audio_result(composition_id, score, audio_id):
+    return {
+        "composition_id": composition_id,
+        "canonical_title": f"Title {composition_id}",
+        "score": score,
+        "score_type": "cosine_distance",
+        "best_matching_audio_id": audio_id,
+        "recording_evidence": [{"audio_id": audio_id, "score": score}],
+    }
+
+
+class MultimodalRetrievalTests(unittest.TestCase):
+    def setUp(self):
+        # The audio engine's scores here are lower-is-better distances. RRF uses
+        # each branch's returned ordering, not the raw incomparable score values.
+        self.text = FakeTextEngine(
+            [text_result("C1", 0.91), text_result("C2", 0.72), text_result("C4")]
+        )
+        self.audio = FakeAudioEngine(
+            [audio_result("C2", 0.04, "R2"), audio_result("C3", 0.8, "R3")]
+        )
+        self.engine = MultimodalRetrievalEngine(
+            self.text, self.audio, text_weight=0.5, audio_weight=0.5, rrf_constant=60
+        )
+
+    def test_text_only_and_audio_only(self):
+        text_results = self.engine.search(text_query="meaning", top_k=2)
+        self.assertEqual([row["composition_id"] for row in text_results], ["C1", "C2"])
+        self.assertEqual(text_results[0]["fused_score"], 1.0)
+        self.assertIsNone(text_results[0]["audio_score"])
+        self.assertEqual(text_results[0]["modalities"], ["text"])
+
+        audio_results = self.engine.search(audio_query_path=Path("query.wav"), top_k=2)
+        self.assertEqual([row["composition_id"] for row in audio_results], ["C2", "C3"])
+        self.assertEqual(audio_results[0]["fused_score"], 1.0)
+        self.assertEqual(self.audio.calls[-1][0], Path("query.wav"))
+
+    def test_combined_rrf_merges_compositions_and_keeps_branch_evidence(self):
+        results = self.engine.search("meaning", "query.wav", top_k=10)
+        self.assertEqual([row["composition_id"] for row in results], ["C2", "C1", "C3", "C4"])
+        self.assertEqual(len({row["composition_id"] for row in results}), len(results))
+        c2 = results[0]
+        self.assertEqual(c2["text_rank"], 2)
+        self.assertEqual(c2["audio_rank"], 1)
+        self.assertEqual(c2["text_score"], 0.72)
+        self.assertEqual(c2["audio_score"], 0.04)
+        self.assertEqual(c2["best_matching_audio_id"], "R2")
+        self.assertEqual(c2["modalities"], ["text", "audio"])
+        self.assertIn("T-C2", str(c2["text_evidence"]))
+        self.assertEqual(c2["fused_score"], (61 / 62 + 1) / 2)
+        c4 = next(row for row in results if row["composition_id"] == "C4")
+        self.assertIsNone(c4["text_score"])
+
+    def test_configurable_weights_and_candidate_deduplication(self):
+        self.text.results = [text_result("C1", 0.4), text_result("C2", 0.3), text_result("C2", 0.2)]
+        weighted = MultimodalRetrievalEngine(
+            self.text,
+            FakeAudioEngine([audio_result("C2", 0.01, "R2")]),
+            text_weight=0.8,
+            audio_weight=0.2,
+            rrf_constant=0,
+        )
+        results = weighted.search("phrase", "audio.mp3")
+        self.assertEqual([row["composition_id"] for row in results], ["C1", "C2"])
+        self.assertAlmostEqual(results[0]["fused_score"], 0.8)
+        self.assertAlmostEqual(results[1]["fused_score"], 0.8 / 2 + 0.2)
+        self.assertEqual(results[1]["text_rank"], 2)
+
+    def test_ties_have_deterministic_composition_id_order(self):
+        engine = MultimodalRetrievalEngine(
+            FakeTextEngine([text_result("Z"), text_result("A")]),
+            FakeAudioEngine([audio_result("A", 0.1, "RA"), audio_result("Z", 0.9, "RZ")]),
+            text_weight=0.5,
+            audio_weight=0.5,
+            rrf_constant=0,
+        )
+        first = engine.search("query", "audio.wav")
+        second = engine.search("query", "audio.wav")
+        self.assertEqual([row["composition_id"] for row in first], ["A", "Z"])
+        self.assertEqual(first, second)
+
+    def test_single_success_with_other_failure_and_all_failures(self):
+        failing_audio = FakeAudioEngine(error=RuntimeError("decode failed"))
+        partial = MultimodalRetrievalEngine(self.text, failing_audio)
+        rows = partial.search("query", "bad.wav")
+        self.assertTrue(rows)
+        self.assertEqual(partial.last_branch_errors, {"audio": "decode failed"})
+        failed = MultimodalRetrievalEngine(
+            FakeTextEngine(error=ValueError("bad model")), failing_audio
+        )
+        with self.assertRaises(RetrievalBranchError) as raised:
+            failed.search("query", "bad.wav")
+        self.assertIn("text", raised.exception.errors)
+        self.assertIn("audio", raised.exception.errors)
+        self.assertEqual(failed.search("query", "bad.wav", raise_on_branch_error=False), [])
+
+    def test_valid_empty_branch_and_empty_union(self):
+        engine = MultimodalRetrievalEngine(
+            FakeTextEngine([]), FakeAudioEngine([audio_result("A", 0.2, "R")]),
+            text_weight=0.5, audio_weight=0.5,
+        )
+        result = engine.search("valid but no hit", "audio.wav")
+        self.assertEqual(result[0]["fused_score"], 0.5)
+        empty = MultimodalRetrievalEngine(FakeTextEngine([]), FakeAudioEngine([]))
+        self.assertEqual(empty.search("q", "p"), [])
+
+    def test_graph_enrichment_never_changes_fused_score(self):
+        class Graph:
+            def get_composition_details(self, composition_id):
+                return {"composition": {"composition_id": composition_id}, "extra": "verified"}
+
+        engine = MultimodalRetrievalEngine(self.text, knowledge_graph=Graph())
+        result = engine.search("text only")[0]
+        self.assertEqual(result["graph_data"]["extra"], "verified")
+        self.assertEqual(result["fused_score"], 1.0)
+
+        class BrokenGraph:
+            def get_composition_details(self, _composition_id):
+                raise RuntimeError("offline")
+
+        engine.knowledge_graph = BrokenGraph()
+        result = engine.search("text only")[0]
+        self.assertIsNone(result["graph_data"])
+        self.assertEqual(engine.last_graph_error, "offline")
+
+    def test_query_weight_and_top_k_validation(self):
+        with self.assertRaises(ValueError):
+            self.engine.search()
+        with self.assertRaises(ValueError):
+            self.engine.search("  ")
+        with self.assertRaises(ValueError):
+            self.engine.search(audio_query_path=" ")
+        with self.assertRaises(ValueError):
+            self.engine.search("q", top_k=0)
+        with self.assertRaises(ValueError):
+            MultimodalRetrievalEngine(text_weight=0, audio_weight=0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+========================================================================================
+FILE: test_text_retrieval.py
+========================================================================================
+"""Unit tests for text_retrieval; these use a deterministic mock encoder."""
+
+import unittest
+
+import numpy as np
+import pandas as pd
+
+from text_retrieval import TextRetrievalEngine, preprocess_text
+
+
+class MockEncoder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode(self, sentences, **_kwargs):
+        self.calls += 1
+        vectors = []
+        for sentence in sentences:
+            text = sentence.casefold()
+            vectors.append(
+                [
+                    float("sacred" in text or "దైవ" in text),
+                    float("mountain" in text or "కొండ" in text),
+                    float("love" in text or "ప్రేమ" in text),
+                ]
+            )
+        return np.asarray(vectors, dtype=np.float32) + 0.01
+
+
+def sample_frames():
+    compositions = pd.DataFrame(
+        [
+            {"composition_id": "A1", "canonical_title": "Sacred Hill"},
+            {"composition_id": "A2", "canonical_title": "Love Song"},
+        ]
+    )
+    text_records = pd.DataFrame(
+        [
+            {"text_id": "T1", "composition_id": "A1", "text_type": "lyrics", "language": "Telugu", "content": "దైవ కొండ"},
+            {"text_id": "T2", "composition_id": "A1", "text_type": "translation", "language": "English", "content": "sacred mountain"},
+            {"text_id": "T3", "composition_id": "A2", "text_type": "translation", "language": "English", "content": "love and devotion"},
+            {"text_id": "T4", "composition_id": "A2", "text_type": "lyrics", "language": "Telugu", "content": "   "},
+        ]
+    )
+    return text_records, compositions
+
+
+class TextRetrievalTests(unittest.TestCase):
+    def setUp(self):
+        self.text_records, self.compositions = sample_frames()
+        self.encoder = MockEncoder()
+        self.engine = TextRetrievalEngine(self.text_records, self.compositions, encoder=self.encoder)
+
+    def test_preprocessing_and_indexing(self):
+        self.assertEqual(preprocess_text("  తెలుగు\n పాట  "), "తెలుగు పాట")
+        self.assertEqual(self.engine.indexed_text_count, 3)
+        self.assertEqual(self.engine.indexed_composition_count, 2)
+        self.assertEqual(self.encoder.calls, 1)
+
+    def test_results_are_composition_ranked_with_evidence(self):
+        results = self.engine.search_text("sacred mountain", top_k=2)
+        self.assertEqual([result["composition_id"] for result in results], ["A1", "A2"])
+        self.assertEqual(results[0]["best_match"]["text_id"], "T1")
+        self.assertTrue(np.isfinite(results[0]["score"]))
+        self.assertEqual(len({result["composition_id"] for result in results}), len(results))
+        self.assertEqual(self.encoder.calls, 2)
+
+    def test_filters_and_validation(self):
+        results = self.engine.search_text("sacred", languages="Telugu", text_types="lyrics")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["best_match"]["text_id"], "T1")
+        self.assertEqual(self.engine.search_text("sacred", languages="Romanized Telugu"), [])
+        with self.assertRaises(ValueError):
+            self.engine.search_text("   ")
+        with self.assertRaises(ValueError):
+            self.engine.search_text("sacred", top_k=0)
+
+    def test_required_columns_and_empty_dataset(self):
+        with self.assertRaisesRegex(ValueError, "missing required"):
+            TextRetrievalEngine(pd.DataFrame(), self.compositions, encoder=MockEncoder())
+        unknown_parent = self.text_records.copy()
+        unknown_parent.loc[0, "composition_id"] = "MISSING"
+        with self.assertRaisesRegex(ValueError, "missing from Compositions"):
+            TextRetrievalEngine(unknown_parent, self.compositions, encoder=MockEncoder())
+        empty = self.text_records.iloc[0:0]
+        engine = TextRetrievalEngine(empty, self.compositions, encoder=MockEncoder())
+        self.assertEqual(engine.search_text("sacred"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+========================================================================================
+FILE: text_retrieval.py
+========================================================================================
+"""Multilingual semantic retrieval over Phase 1 Annamayya text records.
+
+The default encoder is ``sentence-transformers/LaBSE``.  Document and query
+embeddings are L2-normalized, so reported scores are cosine similarities.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from dataclasses import dataclass
+import re
+from typing import Any, Protocol, Sequence
+
+import numpy as np
+import pandas as pd
+
+from data_loader import load_normalized_data
+
+
+DEFAULT_MODEL_NAME = "sentence-transformers/LaBSE"
+REQUIRED_TEXT_COLUMNS = {"text_id", "composition_id", "text_type", "language", "content"}
+REQUIRED_COMPOSITION_COLUMNS = {"composition_id", "canonical_title"}
+
+
+class Encoder(Protocol):
+    """Minimal interface implemented by sentence-transformers encoders."""
+
+    def encode(self, sentences: Sequence[str], **kwargs: Any) -> Any:
+        """Return one embedding vector per input sentence."""
+
+
+def preprocess_text(value: object) -> str | None:
+    """Conservatively normalize whitespace while preserving Unicode and punctuation."""
+    if value is None or pd.isna(value):
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text or None
+
+
+def _normalise_rows(embeddings: Any) -> np.ndarray:
+    vectors = np.asarray(embeddings, dtype=np.float32)
+    if vectors.ndim == 1:
+        vectors = vectors.reshape(1, -1)
+    if vectors.ndim != 2 or vectors.shape[0] == 0 or vectors.shape[1] == 0:
+        raise ValueError("The encoder returned invalid embeddings.")
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("The encoder returned a zero-length embedding.")
+    return vectors / norms
+
+
+def load_labse_model(model_name: str = DEFAULT_MODEL_NAME) -> Encoder:
+    """Load LaBSE once for an index, with a clear dependency/load failure message."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "sentence-transformers is required for semantic retrieval. "
+            "Install dependencies with: python -m pip install -r requirements.txt"
+        ) from exc
+    try:
+        return SentenceTransformer(model_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load multilingual model '{model_name}'. "
+            "The first run needs internet access to download model files."
+        ) from exc
+
+
+@dataclass(frozen=True)
+class IndexedRecord:
+    text_id: str
+    composition_id: str
+    text_type: str
+    language: str
+    content: str
+
+
+class TextRetrievalEngine:
+    """Build and query an in-memory semantic index over normalized text records."""
+
+    def __init__(
+        self,
+        text_records: pd.DataFrame,
+        compositions: pd.DataFrame,
+        *,
+        model_name: str = DEFAULT_MODEL_NAME,
+        encoder: Encoder | None = None,
+    ) -> None:
+        self._validate_inputs(text_records, compositions)
+        self.model_name = model_name
+        self._encoder = encoder if encoder is not None else load_labse_model(model_name)
+        self._composition_metadata = compositions.drop_duplicates("composition_id").set_index("composition_id")
+        self._records = self._prepare_records(text_records)
+        unknown_parents = {record.composition_id for record in self._records} - set(
+            self._composition_metadata.index
+        )
+        if unknown_parents:
+            raise ValueError(
+                "TextRecords contains composition IDs missing from Compositions: "
+                + ", ".join(sorted(unknown_parents))
+            )
+        self._embeddings = self._encode_documents()
+
+    @staticmethod
+    def _validate_inputs(text_records: pd.DataFrame, compositions: pd.DataFrame) -> None:
+        missing_text = sorted(REQUIRED_TEXT_COLUMNS - set(text_records.columns))
+        missing_compositions = sorted(REQUIRED_COMPOSITION_COLUMNS - set(compositions.columns))
+        if missing_text:
+            raise ValueError("TextRecords is missing required column(s): " + ", ".join(missing_text))
+        if missing_compositions:
+            raise ValueError("Compositions is missing required column(s): " + ", ".join(missing_compositions))
+        if not compositions["composition_id"].is_unique:
+            raise ValueError("Compositions must contain unique composition_id values.")
+
+    @staticmethod
+    def _prepare_records(text_records: pd.DataFrame) -> list[IndexedRecord]:
+        seen_text_ids: set[str] = set()
+        records: list[IndexedRecord] = []
+        for _, row in text_records.iterrows():
+            text_id = preprocess_text(row["text_id"])
+            composition_id = preprocess_text(row["composition_id"])
+            content = preprocess_text(row["content"])
+            if text_id is None or composition_id is None or content is None:
+                continue
+            if text_id in seen_text_ids:
+                raise ValueError(f"TextRecords contains duplicate text_id: {text_id}")
+            seen_text_ids.add(text_id)
+            records.append(
+                IndexedRecord(
+                    text_id=text_id,
+                    composition_id=composition_id,
+                    text_type=preprocess_text(row["text_type"]) or "unknown",
+                    language=preprocess_text(row["language"]) or "unknown",
+                    content=content,
+                )
+            )
+        return records
+
+    def _encode_documents(self) -> np.ndarray:
+        if not self._records:
+            return np.empty((0, 0), dtype=np.float32)
+        content = [record.content for record in self._records]
+        return _normalise_rows(self._encoder.encode(content, show_progress_bar=False))
+
+    @property
+    def indexed_text_count(self) -> int:
+        """Number of usable text records in the in-memory index."""
+        return len(self._records)
+
+    @property
+    def indexed_composition_count(self) -> int:
+        """Number of distinct compositions represented by indexed text records."""
+        return len({record.composition_id for record in self._records})
+
+    def search_text(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        languages: str | Sequence[str] | None = None,
+        text_types: str | Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return up to ``top_k`` compositions ranked by maximum cosine similarity.
+
+        Filters apply before similarity ranking.  Each result contains its highest
+        scoring text record as evidence and all matching eligible records.
+        """
+        cleaned_query = preprocess_text(query)
+        if cleaned_query is None:
+            raise ValueError("Query must contain non-whitespace text.")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        if not self._records:
+            return []
+
+        allowed_languages = _normalise_filter(languages)
+        allowed_types = _normalise_filter(text_types)
+        eligible = [
+            index
+            for index, record in enumerate(self._records)
+            if (allowed_languages is None or record.language.casefold() in allowed_languages)
+            and (allowed_types is None or record.text_type.casefold() in allowed_types)
+        ]
+        if not eligible:
+            return []
+
+        query_embedding = _normalise_rows(self._encoder.encode([cleaned_query], show_progress_bar=False))[0]
+        similarities = self._embeddings[eligible] @ query_embedding
+        per_composition: dict[str, list[tuple[float, IndexedRecord]]] = defaultdict(list)
+        for index, score in zip(eligible, similarities, strict=True):
+            per_composition[self._records[index].composition_id].append((float(score), self._records[index]))
+
+        results: list[dict[str, Any]] = []
+        for composition_id, matches in per_composition.items():
+            matches.sort(key=lambda item: (-item[0], item[1].text_id))
+            best_score, best_record = matches[0]
+            metadata = self._composition_metadata.loc[composition_id].to_dict()
+            evidence = [
+                {
+                    "text_id": record.text_id,
+                    "score": score,
+                    "language": record.language,
+                    "text_type": record.text_type,
+                    "content": record.content,
+                }
+                for score, record in matches
+            ]
+            results.append(
+                {
+                    "composition_id": composition_id,
+                    "canonical_title": metadata.get("canonical_title"),
+                    "score": best_score,
+                    "score_type": "cosine_similarity",
+                    "best_match": evidence[0],
+                    "matching_text_records": evidence,
+                    "metadata": metadata,
+                }
+            )
+        return sorted(results, key=lambda item: (-item["score"], item["composition_id"]))[:top_k]
+
+
+def _normalise_filter(values: str | Sequence[str] | None) -> set[str] | None:
+    if values is None:
+        return None
+    raw_values = [values] if isinstance(values, str) else values
+    normalised = {value.casefold() for value in raw_values if preprocess_text(value) is not None}
+    return normalised
+
+
+def build_engine(
+    text_records: pd.DataFrame,
+    compositions: pd.DataFrame,
+    *,
+    model_name: str = DEFAULT_MODEL_NAME,
+    encoder: Encoder | None = None,
+) -> TextRetrievalEngine:
+    """Build a reusable semantic retrieval engine from Phase 1 DataFrames."""
+    return TextRetrievalEngine(
+        text_records, compositions, model_name=model_name, encoder=encoder
+    )
+
+
+def _print_results(results: list[dict[str, Any]]) -> None:
+    if not results:
+        print("No matching compositions were found.")
+        return
+    for position, result in enumerate(results, start=1):
+        evidence = result["best_match"]
+        snippet = evidence["content"].replace("\n", " ")[:180]
+        print(
+            f"{position}. {result['canonical_title']} ({result['composition_id']})\n"
+            f"   cosine similarity: {result['score']:.4f}; "
+            f"{evidence['language']} {evidence['text_type']} [{evidence['text_id']}]\n"
+            f"   {snippet}"
+        )
+
+
+def main() -> None:
+    """Run a small command-line demonstration against the packaged dataset."""
+    parser = argparse.ArgumentParser(description="Search Annamayya text records with LaBSE.")
+    parser.add_argument("query", nargs="?", default="sacred abode of Sri Hari")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--language", action="append", dest="languages")
+    parser.add_argument("--text-type", action="append", dest="text_types")
+    arguments = parser.parse_args()
+
+    compositions, text_records, _ = load_normalized_data()
+    engine = build_engine(text_records, compositions)
+    print(
+        f"Indexed {engine.indexed_text_count} text records across "
+        f"{engine.indexed_composition_count} compositions using {engine.model_name}."
+    )
+    _print_results(
+        engine.search_text(
+            arguments.query,
+            top_k=arguments.top_k,
+            languages=arguments.languages,
+            text_types=arguments.text_types,
+        )
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"Text retrieval could not run: {exc}") from exc
