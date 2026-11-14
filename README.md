@@ -23,19 +23,7 @@ The first text search initializes the LaBSE sentence-transformer and may downloa
 - Search by an uploaded WAV/MP3 recording or combine audio and text. Ranking uses the existing weighted reciprocal-rank fusion behavior.
 - Read full lyrics, transliterations, and meanings; inspect available singer, raga, tala, sources, and play packaged recordings.
 - Explore recordings in the browser-based Remix Studio, including Lo-fi Chill and Temple Hall effects.
-- Ask Gemini for explanations grounded in the active search evidence.
-
-The app does not require Neo4j. Explanation generation requires Gemini.
-
-## Optional service configuration
-
-Set credentials in the environment before launching FastAPI. They are never collected in the browser.
-
-```powershell
-$env:GEMINI_API_KEY="your-google-ai-studio-key"
-$env:GEMINI_MODEL="gemini-3.8-flash"
-uvicorn app:app --reload --port 1234
-```
+The app does not make AI or language-model API calls. Search, song details, duet merging, and browser-based remixing run through the local application.
 
 ## SQL tables
 
@@ -43,9 +31,8 @@ SQLite contains three normalized tables: `Compositions`, `TextRecords`, and `Aud
 
 ## Backend API
 
-- `GET /api/health` — service configuration and collection counts.
+- `GET /api/health` — service status and collection counts.
 - `POST /api/search` — multipart text/audio search, with optional graph enrichment.
 - `GET /api/compositions/{composition_id}` — local composition, text, and audio records.
-- `POST /api/explain` — Gemini explanation for a selected result and search evidence.
 
 The original retrieval modules and command line tools remain available for evaluation and offline use. The web app itself no longer uses Streamlit.

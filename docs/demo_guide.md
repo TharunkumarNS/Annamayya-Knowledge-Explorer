@@ -19,8 +19,8 @@ The first text search initializes LaBSE and can take longer while model weights 
 
 ## Optional services
 
-Neo4j setup is not required; the Connections page and graph enrichment control are removed. Set `GEMINI_API_KEY` and optionally `GEMINI_MODEL` only if you want Gemini explanations.
+Neo4j setup is not required; the Connections page and graph enrichment control are removed. The application makes no AI or language-model API calls.
 
 ## Data and API
 
-`GET /api/health` reports table counts and optional Gemini configuration. `POST /api/search` accepts multipart form data. `GET /api/compositions/{composition_id}` returns source rows; and `POST /api/explain` generates an evidence-grounded answer. See the project README for request fields and SQL table details.
+`GET /api/health` reports table counts. `POST /api/search` accepts multipart form data. `GET /api/compositions/{composition_id}` returns source rows. See the project README for request fields and SQL table details.

@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 
 from audio_retrieval import AudioRetrievalEngine
 from data_loader import DATASET_DIR
-from gemini_explainer import GeminiExplainer, prepare_evidence
 from multimodal_retrieval import MultimodalRetrievalEngine
 from sql_store import DATABASE_PATH, database_stats, initialize_database, load_sql_data
 from text_retrieval import build_engine as build_text_engine
@@ -106,7 +105,6 @@ def home() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "database": str(DATABASE_PATH.name), "tables": database_stats(),
-            "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
             "neo4j_configured": bool(os.getenv("NEO4J_URI") and (os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER")) and os.getenv("NEO4J_PASSWORD"))}
 
 
@@ -228,13 +226,6 @@ def connections(composition_id: str | None = None, field: str | None = None, val
         graph.close()
 
 
-class ExplanationRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=5000)
-    composition_id: str
-    results: list[dict[str, Any]]
-    history: list[dict[str, str]] = Field(default_factory=list)
-
-
 class DuetMergeRequest(BaseModel):
     crossfade_duration_ms: int | None = Field(default=None, ge=1, le=30_000)
     bell_gain_db: float = Field(default=-4.0, ge=-30.0, le=12.0)
@@ -290,16 +281,3 @@ def merge_duet(pair_id: int, request: DuetMergeRequest) -> dict[str, str]:
         LOGGER.exception("Could not save duet output")
         raise HTTPException(500, "Could not save the merged audio file.") from exc
     return {"audio_url": f"/duet-output/{filename}", "filename": filename}
-
-
-@app.post("/api/explain")
-def explain(request: ExplanationRequest) -> dict[str, Any]:
-    data = get_data()
-    evidence = prepare_evidence(request.results, compositions=data["compositions"],
-                                text_records=data["text_records"], audio_records=data["audio_records"],
-                                selected_composition_id=request.composition_id)
-    try:
-        result = GeminiExplainer().explain(request.question, evidence, history=request.history[-3:])
-        return json_safe(result)
-    except Exception as exc:
-        raise HTTPException(503, str(exc)) from exc

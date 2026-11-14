@@ -1,6 +1,4 @@
 const $ = (s) => document.querySelector(s);
-let searchResults = [];
-let askHistory = [];
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const excerpt = (value, limit=300) => { const text = String(value || '').trim(); return text.length > limit ? text.slice(0, text.lastIndexOf(' ', limit)) + '…' : text; };
 async function api(url, options={}) {
@@ -40,10 +38,10 @@ $('#merge-button').addEventListener('click',async()=>{
   }catch(e){message('#duet-pair-message',e.message,'error');}finally{button.disabled=false;button.innerHTML='Create duet <span>→</span>';}
 });
 $('#search-form').addEventListener('submit', async e=>{
- e.preventDefault(); searchResults=[]; askHistory=[]; $('#results-section').hidden=true; $('#results').replaceChildren(); $('#ask-section').hidden=true; message('#search-message','Preparing indexes and searching…');
+ e.preventDefault(); $('#results-section').hidden=true; $('#results').replaceChildren(); message('#search-message','Preparing indexes and searching…');
  const button=$('#search-button'); button.disabled=true; button.textContent='Searching…';
  const form=new FormData(); form.append('text_query',$('#query').value); form.append('enrich_graph','false'); const file=$('#audio').files[0]; if(file)form.append('audio',file);
- try { const data=await api('/api/search',{method:'POST',body:form}); searchResults=data.results||[]; message('#search-message',data.graph_warning||Object.values(data.branch_errors||{}).join(' · '),data.graph_warning?'':'error'); renderResults(searchResults); }
+ try { const data=await api('/api/search',{method:'POST',body:form}); const results=data.results||[]; message('#search-message',data.graph_warning||Object.values(data.branch_errors||{}).join(' · '),data.graph_warning?'':'error'); renderResults(results); }
  catch(err){message('#search-message',err.message,'error');}
  finally{button.disabled=false;button.innerHTML='Find compositions <span>→</span>';}
 });
@@ -65,10 +63,7 @@ function renderResults(results){
  document.querySelectorAll('.details-button').forEach(b=>b.addEventListener('click',()=>showDetails(b.dataset.id)));
  document.querySelectorAll('.remix-button').forEach(b=>b.addEventListener('click',()=>openRemix(b.dataset.src)));
  document.querySelectorAll('.evidence-button').forEach(b=>b.addEventListener('click',()=>{const panel=b.closest('.result-card').querySelector('.evidence');panel.hidden=!panel.hidden;}));
- $('#ask-composition').innerHTML=results.map(r=>`<option value="${esc(r.composition_id)}">${esc(r.canonical_title||r.composition_id)}</option>`).join(''); $('#ask-section').hidden=false;
 }
 async function showDetails(id){try{const d=await api(`/api/compositions/${encodeURIComponent(id)}`);const c=d.composition;$('#details-content').innerHTML=`<h2 class="detail-title">${esc(c.canonical_title||id)}</h2><p class="detail-meta">${[['Singer',c.singer],['Raga',c.raga],['Tala',c.tala]].filter(x=>x[1]).map(x=>`${x[0]}: ${esc(x[1])}`).join(' · ')}</p>${d.text_records.map(t=>`<section class="detail-block"><h3>${esc(t.language||t.text_type)}</h3><p>${esc(t.content)}</p>${t.source_url?`<a class="text-source" href="${esc(t.source_url)}" target="_blank" rel="noopener">Open source</a>`:''}</section>`).join('')||'<p>No text variants are available.</p>'}${d.audio_records.map(a=>`<section class="detail-block"><h3>${esc(a.recording_title||a.audio_id)}</h3><audio class="detail-audio" controls preload="none" src="/media/${encodeURIComponent(a.audio_path.split(/[\\/]/).pop())}"></audio></section>`).join('')}`;$('#details-dialog').showModal();}catch(e){message('#search-message',e.message,'error');}}
 $('#details-dialog').querySelector('.dialog-close').addEventListener('click',()=>$('#details-dialog').close());
-$('#ask-composition').addEventListener('change',()=>{askHistory=[];$('#answer').hidden=true;});
-$('#ask-form').addEventListener('submit',async e=>{e.preventDefault();const question=$('#question').value.trim();if(!question)return;const area=$('#answer');area.hidden=false;area.textContent='Preparing an evidence-grounded explanation…';try{const result=await api('/api/explain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,composition_id:$('#ask-composition').value,results:searchResults,history:askHistory.slice(-3)})});const answer=result.answer||result.text||JSON.stringify(result);area.textContent=answer;askHistory.push({question,answer});askHistory=askHistory.slice(-3);}catch(err){area.textContent=err.message;}});
 init();
