@@ -110,6 +110,23 @@ def health() -> dict[str, Any]:
             "neo4j_configured": bool(os.getenv("NEO4J_URI") and (os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER")) and os.getenv("NEO4J_PASSWORD"))}
 
 
+@app.get("/api/recordings")
+def recordings() -> dict[str, Any]:
+    """List packaged recordings available to Remix Studio."""
+    compositions, _texts, audio = load_sql_data()
+    titles = dict(zip(compositions["composition_id"].astype(str), compositions["canonical_title"]))
+    rows = []
+    for record in audio.to_dict("records"):
+        filename = Path(str(record.get("audio_path", "")).replace("\\", "/")).name
+        if not filename or not (DATASET_DIR / "Recordings" / filename).is_file():
+            continue
+        composition_id = str(record.get("composition_id", ""))
+        rows.append({"audio_id": record.get("audio_id"), "composition_id": composition_id,
+                     "file": filename, "title": record.get("recording_title") or titles.get(composition_id) or filename,
+                     "singer": record.get("singer"), "raga": record.get("raga"), "tala": record.get("tala")})
+    return json_safe({"recordings": rows})
+
+
 @app.post("/api/search")
 async def search(
     text_query: str = Form(""),
